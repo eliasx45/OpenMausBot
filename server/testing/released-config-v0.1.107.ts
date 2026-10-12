@@ -1,4 +1,5 @@
-// Vendored, unmodified apart from import paths: server/config.ts as released in
+// Vendored, unmodified apart from import paths (mcp-registry is the vendored
+// v0.1.107 one too): server/config.ts as released in
 // OpenMausBot v0.1.107 (`git show v0.1.107:server/config.ts`). The daily build
 // shares ~/.openmausbot with that release, whose parseStoredConfig ignores the
 // WHOLE config.json on any schema error; server/config-released-compat.test.ts
@@ -22,7 +23,7 @@ import { EFFORT_LEVELS, type EffortLevel, type LiveSettings } from "../../shared
 import { isModelVariant, type InstanceConfigMap, type ModelSelection } from "../contracts.ts";
 import { PROVIDER_ICON_PRESETS, providerIconError } from "../../shared/provider-icon.ts";
 import type { McpServerSpec } from "../contracts.ts";
-import { isRemoteMcpServer, parseStoredMcpServer } from "../mcp-registry.ts";
+import { isRemoteMcpServer, parseStoredMcpServer } from "./released-mcp-registry-v0.1.107.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "../schema.ts";
 
 const optionalText = z.string().optional();

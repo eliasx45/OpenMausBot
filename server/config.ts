@@ -1092,7 +1092,34 @@ function takeReleasedIncompatible(disk: JsonObject): JsonObject {
     });
     if (Object.keys(extras).length) dev.browserProfiles = extras;
   }
+  // mcpServers.<name>.<key> v0.1.107's registry does not know (resultBudget):
+  // its appConfig reads mcpServers loosely, but mcp-registry.ts parses each
+  // entry with .strict() schemas, so such a server would vanish there.
+  if (isJsonObject(disk.mcpServers)) {
+    const extras: JsonObject = {};
+    for (const [name, entry] of Object.entries(disk.mcpServers)) {
+      if (!isJsonObject(entry)) continue;
+      const moved = Object.keys(entry).filter((key) => !RELEASED_MCP_SERVER_KEYS.has(key));
+      if (!moved.length) continue;
+      extras[name] = Object.fromEntries(moved.map((key) => [key, entry[key] ?? null]));
+      disk.mcpServers[name] = Object.fromEntries(Object.entries(entry).filter(([key]) => RELEASED_MCP_SERVER_KEYS.has(key)));
+    }
+    if (Object.keys(extras).length) dev.mcpServers = extras;
+  }
   return dev;
+}
+
+/** The keys v0.1.107's stdio and remote mcpServers entry schemas accept. */
+const RELEASED_MCP_SERVER_KEYS = new Set(["command", "args", "env", "type", "url", "headers", "oauth", "enabled"]);
+
+/** overlayDevConfig, minus config.dev.json servers config.json no longer has
+ * (the released app removed them), so no key-only stub entry is revived. */
+function overlayDevConfigFile(disk: JsonValue, dev: JsonObject): JsonValue {
+  if (isJsonObject(dev.mcpServers)) {
+    const servers = isJsonObject(disk) && isJsonObject(disk.mcpServers) ? disk.mcpServers : {};
+    dev = { ...dev, mcpServers: Object.fromEntries(Object.entries(dev.mcpServers).filter(([name]) => Object.hasOwn(servers, name))) };
+  }
+  return overlayDevConfig(disk, dev);
 }
 
 /** config.dev.json laid over config.json: objects merge key by key, an
@@ -1144,7 +1171,7 @@ function migrateReleasedIncompatibleConfig(): void {
     const disk = parseJson(readFileSync(p, "utf8"));
     if (!isJsonObject(disk)) return;
     if (!Object.keys(takeReleasedIncompatible(structuredClone(disk))).length) return;
-    writeConfigFiles(overlayDevConfig(disk, readDevConfig()) as JsonObject);
+    writeConfigFiles(overlayDevConfigFile(disk, readDevConfig()) as JsonObject);
     console.log(`[config] moved settings the released app cannot read to ${DEV_CONFIG_FILE}`);
   } catch (error) {
     console.error(`[config] could not move settings to ${DEV_CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`);
@@ -1158,7 +1185,7 @@ let lastIgnoredConfigWarning = "";
 export function loadConfig(): AppConfig {
   let cfg: AppConfig = {};
   try {
-    cfg = parseStoredConfig(overlayDevConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")), readDevConfig()));
+    cfg = parseStoredConfig(overlayDevConfigFile(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")), readDevConfig()));
     lastIgnoredConfigWarning = "";
   } catch (error) {
     // No file yet is a normal first run: env fallbacks below. Any other failure
@@ -1523,7 +1550,7 @@ export function saveConfig(
     /* first write */
   }
   // daily build: merge against the full config, config.dev.json included
-  disk = overlayDevConfig(disk, readDevConfig()) as JsonObject;
+  disk = overlayDevConfigFile(disk, readDevConfig()) as JsonObject;
   const checkedPatch = appConfigSchema.partial().extend({ threads: threadsPatchSchema.optional(), newBots: newBotsPatchSchema.optional() }).parse(patch);
   const before = configSaveListeners.size ? structuredClone(disk) : disk;
   // A write is the durable migration point. Preserve every other raw key in

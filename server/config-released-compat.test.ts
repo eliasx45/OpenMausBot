@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR, DEV_CONFIG_FILE, ensureDirs, loadConfig, saveConfig } from "./config.ts";
 import { parseStoredConfig as parseReleasedConfig } from "./testing/released-config-v0.1.107.ts";
+import { parseStoredMcpServer as parseReleasedMcpServer } from "./testing/released-mcp-registry-v0.1.107.ts";
 
 const configFile = () => join(DATA_DIR, "config.json");
 const devFile = () => join(DATA_DIR, DEV_CONFIG_FILE);
@@ -93,5 +94,30 @@ describe("config shared with the released v0.1.107", () => {
     const before = readFileSync(configFile(), "utf8");
     ensureDirs();
     expect(readFileSync(configFile(), "utf8")).toBe(before);
+  });
+
+  it("keeps a per-server MCP result budget out of the released app's config.json", () => {
+    saveConfig({ mcpServers: { "effectcraft-app": { command: "effectcraft-mcp", args: ["--bridge", "9877"], resultBudget: 40_000 } } });
+    const released = readJson(configFile());
+    expect(() => parseReleasedConfig(released)).not.toThrow();
+    // v0.1.107's registry (strict entry schemas) still loads the server itself
+    expect(released.mcpServers["effectcraft-app"]).toEqual({ command: "effectcraft-mcp", args: ["--bridge", "9877"] });
+    expect(parseReleasedMcpServer("effectcraft-app", released.mcpServers["effectcraft-app"]).ok).toBe(true);
+    expect(parseReleasedMcpServer("effectcraft-app", { ...released.mcpServers["effectcraft-app"], resultBudget: 40_000 }).ok).toBe(false);
+    expect(readJson(devFile())).toEqual({ mcpServers: { "effectcraft-app": { resultBudget: 40_000 } } });
+    expect(loadConfig().mcpServers?.["effectcraft-app"]).toEqual({ command: "effectcraft-mcp", args: ["--bridge", "9877"], resultBudget: 40_000 });
+
+    // the released app deletes the server: the budget is not revived as a stub
+    writeFileSync(configFile(), JSON.stringify({ ...released, mcpServers: {} }, null, 2));
+    expect(loadConfig().mcpServers).toEqual({});
+  });
+
+  it("moves an MCP result budget out of an existing config.json at boot", () => {
+    writeFileSync(configFile(), JSON.stringify({
+      mcpServers: { "effectcraft-app": { command: "effectcraft-mcp", resultBudget: 40_000 } },
+    }, null, 2));
+    ensureDirs();
+    expect(readJson(configFile())).toEqual({ mcpServers: { "effectcraft-app": { command: "effectcraft-mcp" } } });
+    expect(loadConfig().mcpServers?.["effectcraft-app"]).toEqual({ command: "effectcraft-mcp", resultBudget: 40_000 });
   });
 });
