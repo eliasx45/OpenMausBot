@@ -221,6 +221,7 @@ import {
   EVENTS_DIR,
   NATIVE_DIR,
   customMcpServers,
+  customMcpResultBudgets,
   onConfigSaved,
   CLAUDE_API_INSTANCE,
   liveSettingsFor,
@@ -661,6 +662,7 @@ import { createBotPresetRoutes } from "./routes/bot-presets.ts";
 import { createBotMemoryRoutes } from "./routes/bot-memory.ts";
 import { createDeciderRoutes } from "./routes/decider.ts";
 import { createBrowserSiteRoutes } from "./routes/browser-sites.ts";
+import { createSignInCardRoutes } from "./routes/sign-in-cards.ts";
 import { createThreadModelRoutes } from "./routes/thread-models.ts";
 import { createUndoRoutes } from "./routes/undo.ts";
 import { createDesktopViewer, desktopViewerUrl } from "./routes/desktop-viewer.ts";
@@ -10896,7 +10898,11 @@ async function startTurn(
       // never pre-allowed, so every call rides the normal permission flow.
       if (instance.adapter.capabilities.customMcp === true) {
         const custom = await withMcpSignIn(engineMcpServers(bot), mcpOAuth);
-        if (Object.keys(custom).length) integrations.custom = custom;
+        if (Object.keys(custom).length) {
+          integrations.custom = custom;
+          const budgets = customMcpResultBudgets(cfg, Object.keys(custom));
+          if (Object.keys(budgets).length) integrations.customResultBudgets = budgets;
+        }
       }
       // CLI engines work inside the bot's own workspace directory rather
       // than the user's home: a bot with file tools and acceptEdits gets a
@@ -13646,7 +13652,11 @@ async function runClaimedGroupMemberTurn(
   // user-configured MCP servers: same gating as the 1:1 site above.
   if (instance.adapter.capabilities.customMcp === true) {
     const custom = await withMcpSignIn(engineMcpServers(bot), mcpOAuth);
-    if (Object.keys(custom).length) integrations.custom = custom;
+    if (Object.keys(custom).length) {
+      integrations.custom = custom;
+      const budgets = customMcpResultBudgets(cfg, Object.keys(custom));
+      if (Object.keys(budgets).length) integrations.customResultBudgets = budgets;
+    }
   }
   // Connected-app discovery is intentionally awaited before a provider owns
   // the bot. An interrupt during that setup window must still stop the queued
@@ -16759,7 +16769,7 @@ function mcpServerBody(body: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (!body || typeof body !== "object") return out;
   const record = body as Record<string, unknown>;
-  for (const key of ["command", "args", "env", "type", "url", "headers", "oauth", "enabled"]) {
+  for (const key of ["command", "args", "env", "type", "url", "headers", "oauth", "enabled", "resultBudget"]) {
     if (record[key] !== undefined) out[key] = record[key];
   }
   return out;
@@ -17176,6 +17186,7 @@ ROUTES.push(createBotMemoryRoutes({
   },
 }));
 ROUTES.push(createDeciderRoutes({ decider }));
+ROUTES.push(createSignInCardRoutes({ settle: settleSignIn }));
 ROUTES.push(createBrowserSiteRoutes({
   target: (which) => {
     const engine = browserEngineStatus();
@@ -26309,15 +26320,6 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const state = currentSecretState(m[1], threadId, message.id);
       if (!state) return json(res, 409, { error: "this credential request is no longer available" });
       return json(res, 200, { dismissed: true, resumed: state.resumed });
-    }
-
-    // A sign-in card's two answers. Nothing secret crosses here: the person
-    // typed the password into the page itself, never into OpenMausBot.
-    m = path.match(/^\/api\/bots\/([\w-]+)\/sign-in-cards\/([\w-]+)\/(done|cancel)$/);
-    if (m && method === "POST") {
-      const body = await readBody(req);
-      const result = settleSignIn(m[1], String(body.threadId ?? ""), m[2], m[3] === "done" ? "done" : "cancelled");
-      return json(res, result.status, result.body);
     }
 
     // Inline connection cards are bound to both the bot and the exact task
