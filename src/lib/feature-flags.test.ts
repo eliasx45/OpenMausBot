@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { builtInBrowserEnabled, llmThreadTitlesEnabled, parseSkillReviewSteps, routinesInConversationEnabled, sharedComputersEnabled, showToolCallsEnabled, skillAuthoringEnabled, skillReviewEnabled, skillReviewSteps } from "./feature-flags";
+import { builtInBrowserEnabled, llmThreadTitlesEnabled, parseSkillReviewSteps, routinesInConversationEnabled, shareLearnedSkillsMode, sharedComputersEnabled, showToolCallsEnabled, skillAuthoringEnabled, skillReviewEnabled, skillReviewSteps } from "./feature-flags";
 
 describe("experimental feature flags", () => {
   it("keeps skill authoring on by default, before and after the config arrives", () => {
@@ -63,5 +63,13 @@ describe("experimental feature flags", () => {
     expect(llmThreadTitlesEnabled({ features: {} })).toBe(false);
     expect(llmThreadTitlesEnabled({ features: { llmThreadTitles: false } })).toBe(false);
     expect(llmThreadTitlesEnabled({ features: { llmThreadTitles: true } })).toBe(true);
+  });
+
+  it("offers sharing learned skills only with the skills library, asking by default", () => {
+    expect(shareLearnedSkillsMode(null)).toBe("off");
+    expect(shareLearnedSkillsMode({ features: { shareLearnedSkills: "auto" } })).toBe("off");
+    expect(shareLearnedSkillsMode({ features: { skillsLibrary: true } })).toBe("ask");
+    expect(shareLearnedSkillsMode({ features: { skillsLibrary: true, shareLearnedSkills: "auto" } })).toBe("auto");
+    expect(shareLearnedSkillsMode({ features: { skillsLibrary: true, shareLearnedSkills: "off" } })).toBe("off");
   });
 });

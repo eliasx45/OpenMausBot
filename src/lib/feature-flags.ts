@@ -1,7 +1,7 @@
 import { t } from "./i18n";
 
 export interface FeatureFlagConfig {
-  features?: { skillAuthoring?: boolean; skillReview?: boolean; skillReviewSteps?: number; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; routinesInConversation?: boolean; llmThreadTitles?: boolean; skillsLibrary?: boolean };
+  features?: { skillAuthoring?: boolean; skillReview?: boolean; skillReviewSteps?: number; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; routinesInConversation?: boolean; llmThreadTitles?: boolean; skillsLibrary?: boolean; shareLearnedSkills?: "off" | "ask" | "auto" };
   browserEngine?: { kind: "engine" | "unavailable"; reason?: string; installable?: boolean; installing?: boolean; installError?: string };
 }
 
@@ -100,3 +100,12 @@ export function llmThreadTitlesEnabled(config: FeatureFlagConfig | null | undefi
 export function skillsLibraryEnabled(config: FeatureFlagConfig | null | undefined): boolean {
   return config?.features?.skillsLibrary === true;
 }
+
+/** How a learned skill reaches the author's team — mirrors the server's
+ * shareLearnedSkillsMode: "off" without the skills library, else "ask"
+ * (a Share with team button on the receipt) unless set. */
+export function shareLearnedSkillsMode(config: FeatureFlagConfig | null | undefined): "off" | "ask" | "auto" {
+  if (!skillsLibraryEnabled(config)) return "off";
+  return config?.features?.shareLearnedSkills ?? "ask";
+}
+
