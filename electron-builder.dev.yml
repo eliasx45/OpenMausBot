@@ -1,0 +1,22 @@
+# OpenMausBot Dev: Elias's daily integration build (elias/daily only).
+#   CSC_IDENTITY_AUTO_DISCOVERY=false pnpm package:mac:daily
+# A separate app beside the released OpenMausBot, sharing ~/.openmausbot
+# with it (used one at a time; the data-dir lease and the single-instance
+# lock refuse a second one). What differs from electron-builder.yml:
+# - its own bundle id and name, so macOS keeps the two apps apart;
+# - package.json keeps name "openmausbot" (no productName here), so
+#   Electron's app name, userData folder (~/Library/Application Support/
+#   openmausbot) and safeStorage Keychain item ("openmausbot Safe Storage")
+#   are the released app's: credentials.bin stays readable by both;
+# - openmausbotDailyBuild switches the auto-updater off (electron/updater.mjs)
+#   and leaves openmausbot:// links with the released app;
+# - unsigned (ad-hoc), never notarized or published.
+extends: ./electron-builder.yml
+appId: com.openmausbot.app.dev
+productName: OpenMausBot Dev
+artifactName: OpenMausBot-Dev-${version}-${arch}.${ext}
+extraMetadata:
+  openmausbotDailyBuild: true
+# electron-builder merges protocols with the parent; scripts/daily-finish-mac-app.sh drops the URL type
+protocols: []
+publish: null

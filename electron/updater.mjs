@@ -106,9 +106,21 @@ export function attachUpdaterWindow(mainWindow) {
   win = mainWindow;
 }
 
+/** Daily build (elias/daily): electron-builder.dev.yml stamps the packaged
+ * package.json with `openmausbotDailyBuild`. That app must never update
+ * itself: the update feed is the official release, which would replace the
+ * integration build with the released app. */
+export function isDailyBuild() {
+  try {
+    return require("../package.json").openmausbotDailyBuild === true;
+  } catch {
+    return false;
+  }
+}
+
 export function startUpdater() {
   // dev / unsigned builds can't auto-update — leave the banner dormant
-  if (!app.isPackaged) {
+  if (!app.isPackaged || isDailyBuild()) {
     updaterCoordinator = null;
     setState({ status: "idle" });
     return;

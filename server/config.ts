@@ -1,7 +1,7 @@
 // Config + data dirs. One file, ~/.openmausbot/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"apiKey":"ak_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
-import { readFileSync, mkdirSync, existsSync, renameSync, statSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -1025,6 +1025,7 @@ export function ensureDirs() {
   }
   for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
   migrateLegacyFeatureFlags();
+  migrateReleasedIncompatibleConfig();
 }
 
 /** `features.skillRecorder` became `features.skillAuthoring` when the Teach a
@@ -1054,6 +1055,102 @@ function migrateLegacyFeatureFlags(): void {
   }
 }
 
+// ── Daily build (elias/daily) only ──────────────────────────────────────
+// This build shares ~/.openmausbot with the released OpenMausBot v0.1.107,
+// the two used one at a time. That release parses config.json with strict
+// schemas and, on ANY schema error, ignores the WHOLE file for the session
+// (every engine, account and setting appears gone). So a value only this
+// build understands and v0.1.107 REJECTS never stays in config.json: it
+// lives in config.dev.json beside it. saveConfig moves such values there,
+// loadConfig lays config.dev.json back over config.json, and the boot-time
+// migration below moves any that an earlier run left in config.json.
+// Keys v0.1.107 merely does not know (top-level sections, flags in its
+// non-strict `features`/`context`) are not moved: it strips them on read
+// and its saveConfig keeps them on disk untouched.
+// config.dev.json has config.json's shape, except that an id-keyed object
+// stands for an array of `{ id }` records (browserProfiles).
+// server/config-released-compat.test.ts checks every new setting against
+// v0.1.107's own parser (server/testing/released-config-v0.1.107.ts).
+export const DEV_CONFIG_FILE = "config.dev.json";
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Takes out of `disk` (in place) every value v0.1.107 rejects; returns them. */
+function takeReleasedIncompatible(disk: JsonObject): JsonObject {
+  const dev: JsonObject = {};
+  // browserProfiles[].browser ("chrome" = My Chrome): v0.1.107's
+  // browserProfileSchema is .strict(), so one such profile voids the file.
+  if (Array.isArray(disk.browserProfiles)) {
+    const extras: JsonObject = {};
+    disk.browserProfiles = disk.browserProfiles.map((profile) => {
+      if (!isJsonObject(profile) || typeof profile.id !== "string" || !Object.hasOwn(profile, "browser")) return profile;
+      const { browser, ...rest } = profile;
+      extras[profile.id] = { browser: browser ?? null };
+      return rest;
+    });
+    if (Object.keys(extras).length) dev.browserProfiles = extras;
+  }
+  return dev;
+}
+
+/** config.dev.json laid over config.json: objects merge key by key, an
+ * id-keyed object merges into an array of `{ id }` records by id (an id no
+ * longer in the array is dropped), anything else replaces. */
+function overlayDevConfig(base: JsonValue | undefined, dev: JsonValue): JsonValue {
+  if (Array.isArray(base) && isJsonObject(dev)) {
+    return base.map((item) => {
+      const extra = isJsonObject(item) && typeof item.id === "string" ? dev[item.id] : undefined;
+      return extra === undefined ? item : overlayDevConfig(item, extra);
+    });
+  }
+  if (!isJsonObject(base) || !isJsonObject(dev)) return dev;
+  const merged: JsonObject = { ...base };
+  for (const [key, value] of Object.entries(dev)) merged[key] = overlayDevConfig(base[key], value);
+  return merged;
+}
+
+/** config.dev.json, or {} when it is missing or unreadable. */
+function readDevConfig(): JsonObject {
+  try {
+    const parsed = parseJson(readFileSync(join(DATA_DIR, DEV_CONFIG_FILE), "utf8"));
+    return isJsonObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Writes both files from the full (overlaid) config: config.dev.json first,
+ * so a failure in between leaves a value in both places, never in neither.
+ * Same atomic write and owner-only mode as config.json. */
+function writeConfigFiles(full: JsonObject): JsonObject {
+  const released = structuredClone(full);
+  const dev = takeReleasedIncompatible(released);
+  const devPath = join(DATA_DIR, DEV_CONFIG_FILE);
+  if (Object.keys(dev).length) writeFileAtomic(devPath, JSON.stringify(dev, null, 2), { mode: 0o600 });
+  else rmSync(devPath, { force: true });
+  writeFileAtomic(join(DATA_DIR, "config.json"), JSON.stringify(released, null, 2), { mode: 0o600 });
+  return released;
+}
+
+/** Once per boot: move values v0.1.107 rejects out of config.json (left by a
+ * build before this split, or by a hand edit). A file that is fine is not
+ * rewritten. */
+function migrateReleasedIncompatibleConfig(): void {
+  const p = join(DATA_DIR, "config.json");
+  try {
+    if (!existsSync(p)) return;
+    const disk = parseJson(readFileSync(p, "utf8"));
+    if (!isJsonObject(disk)) return;
+    if (!Object.keys(takeReleasedIncompatible(structuredClone(disk))).length) return;
+    writeConfigFiles(overlayDevConfig(disk, readDevConfig()) as JsonObject);
+    console.log(`[config] moved settings the released app cannot read to ${DEV_CONFIG_FILE}`);
+  } catch (error) {
+    console.error(`[config] could not move settings to ${DEV_CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 /** The last "config.json is being ignored" warning, so a file that stays
  * broken is reported once rather than on every loadConfig() call. */
 let lastIgnoredConfigWarning = "";
@@ -1061,7 +1158,7 @@ let lastIgnoredConfigWarning = "";
 export function loadConfig(): AppConfig {
   let cfg: AppConfig = {};
   try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
+    cfg = parseStoredConfig(overlayDevConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")), readDevConfig()));
     lastIgnoredConfigWarning = "";
   } catch (error) {
     // No file yet is a normal first run: env fallbacks below. Any other failure
@@ -1163,6 +1260,10 @@ export function cacheUntilConfigChanges<T>(derive: (config: AppConfig) => T): ()
     try {
       const file = statSync(join(DATA_DIR, "config.json"), { bigint: true });
       if (Date.now() - Number(file.mtimeMs) >= 2_000) stamp = `${file.ino}:${file.size}:${file.mtimeNs}:${file.ctimeNs}`;
+      // daily build: config.dev.json is part of what loadConfig() reads
+      const dev = statSync(join(DATA_DIR, DEV_CONFIG_FILE), { bigint: true, throwIfNoEntry: false });
+      if (dev && Date.now() - Number(dev.mtimeMs) < 2_000) stamp = null;
+      else if (stamp !== null && dev) stamp += `|${dev.ino}:${dev.size}:${dev.mtimeNs}:${dev.ctimeNs}`;
     } catch {
       // Missing or out of reach: read it the way loadConfig() always has.
     }
@@ -1421,6 +1522,8 @@ export function saveConfig(
   } catch {
     /* first write */
   }
+  // daily build: merge against the full config, config.dev.json included
+  disk = overlayDevConfig(disk, readDevConfig()) as JsonObject;
   const checkedPatch = appConfigSchema.partial().extend({ threads: threadsPatchSchema.optional(), newBots: newBotsPatchSchema.optional() }).parse(patch);
   const before = configSaveListeners.size ? structuredClone(disk) : disk;
   // A write is the durable migration point. Preserve every other raw key in
@@ -1547,7 +1650,8 @@ export function saveConfig(
     }
   }
   mkdirSync(DATA_DIR, { recursive: true });
-  writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
+  // daily build: what v0.1.107 rejects goes to config.dev.json instead
+  writeConfigFiles(disk);
   for (const listener of configSaveListeners) {
     try {
       listener(before, disk);
