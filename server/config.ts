@@ -343,6 +343,11 @@ const featureConfigSchema = z.object({
   /** Learn from group chats: memory upkeep also reads a member bot's room
    * turns. Off until explicitly enabled — see roomMemoryCaptureEnabled. */
   roomMemoryCapture: z.boolean().optional(),
+  /** Share learned skills with the author's team through the skills
+   * library: "off", "ask" (a Share with team button on the receipt, the
+   * default) or "auto" (shared as soon as it applies). Inert while
+   * skillsLibrary is off — see shareLearnedSkillsMode. */
+  shareLearnedSkills: z.enum(["off", "ask", "auto"]).optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -670,7 +675,7 @@ export interface AppConfig {
    * seats shared by all conversations, with per-thread affinity (#1654). */
   localVm?: { mode?: "shared" | "per-bot" | "pool"; maxInstances?: number; idleTimeoutMinutes?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillAuthoring?: boolean; skillReview?: boolean; skillReviewSteps?: number; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean; autoRecall?: boolean; routinesInConversation?: boolean; skillsLibrary?: boolean; roomMemoryCapture?: boolean };
+  features?: { skillAuthoring?: boolean; skillReview?: boolean; skillReviewSteps?: number; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean; autoRecall?: boolean; routinesInConversation?: boolean; skillsLibrary?: boolean; shareLearnedSkills?: "off" | "ask" | "auto"; roomMemoryCapture?: boolean };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[]; firstTurnAt?: string };
   /** Named browser sessions any bot can be pointed at. */
@@ -965,6 +970,14 @@ export function llmThreadTitlesEnabled(cfg: AppConfig): boolean {
 export function skillsLibraryEnabled(cfg: AppConfig): boolean {
   return cfg.features?.skillsLibrary === true;
  }
+
+/** How learned skills reach the author's team (server/skill-share.ts).
+ * Always "off" while the skills library is off, so flag-off behavior stays
+ * byte-identical; otherwise "ask" unless set. */
+export function shareLearnedSkillsMode(cfg: AppConfig): "off" | "ask" | "auto" {
+  if (!skillsLibraryEnabled(cfg)) return "off";
+  return cfg.features?.shareLearnedSkills ?? "ask";
+}
 
 /** What each engine is launched with, as far as a config write can change
  * it: its instance config (driver, settings, and the credentials
