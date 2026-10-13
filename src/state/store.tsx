@@ -240,7 +240,7 @@ export interface Message {
   /** rooms: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: MausColor };
   /** a user-role line another bot delivered into this conversation
-   * (ask_bot, delegate_bot, start_thread): the words are that bot's, not
+   * (coordinate_bots, start_thread): the words are that bot's, not
    * the person's. Rendered as the peer speaking — see lib/peer-message. */
   peerAsk?: { botId: string; name: string; unattended?: boolean };
   /** coordinate_bots delivery identity, as stored: the request a teammate
@@ -282,7 +282,7 @@ export interface Group {
    * conversation. The New divider goes after it. */
   lastReadMessageId?: string;
   createdAt: number;
-  /** auto-created bot⇄bot channel (ask_bot exchanges mirror here) */
+  /** auto-created bot⇄bot channel (bot-to-bot exchanges mirror here) */
   dm?: boolean;
   busyBotId?: string | null;
   /** when the busy member's turn started — the group-side twin of a task's
@@ -518,7 +518,7 @@ export interface Bot {
   chiefOfStaff?: boolean;
   /** Additional teams the owner explicitly lets this Chief work with. */
   managedSections?: string[];
-  /** When this bot wants to talk to another bot (ask_bot/delegate_bot),
+  /** When this bot wants to talk to another bot (coordinate_bots),
    * pause and ask the user first. Off by default. */
   approvePeerComms?: boolean;
   /** Explicit peer allow-list (bot ids); absent = every bot in its section,
@@ -576,6 +576,15 @@ export interface BotProject {
 }
 
 export type ProjectUpdatePatch = { name?: string; emoji?: string | null };
+
+/** The level each of a bot's threads runs at: its own, else the bot's (as
+ * currentTaskBot resolves it). */
+export function threadApprovalModes(bot: Pick<Bot, "approvalMode" | "autoApprove" | "tasks">): ApprovalMode[] {
+  return (bot.tasks ?? []).map((task) => approvalModeFor({
+    approvalMode: task.approvalMode ?? (task.autoApprove === undefined ? bot.approvalMode : undefined),
+    autoApprove: task.autoApprove ?? bot.autoApprove,
+  }));
+}
 
 /** A conversation uses its own execution settings; the sidebar keeps the
  * original bot's aggregate presence and profile defaults. */
@@ -951,6 +960,9 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** This engine can make the quick background model call memory upkeep
+     * and the skill review use. */
+    backgroundText?: boolean;
   };
   /** `custom` agents sit below the rail divider — no subscription catalog. */
   access?: "subscription" | "custom" | "api";
@@ -2429,6 +2441,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const {
         acknowledgeLocalAuto: _localAck,
         applyToAllThreads: _allThreads,
+        keepThreadModels: _keepThreadModels,
         computer,
         connectorTools,
         connectorScopes,
@@ -2960,9 +2973,11 @@ export async function persistBotUpdate(
     applyToAllThreads,
     ...ordinaryPatch
   } = patch;
-  const leavesCustom = approvalMode !== undefined &&
-    approvalModeFor(currentBot ?? {}) === "custom" &&
-    approvalMode !== "custom";
+  // Leaving Custom takes the private channel, for the bot or, when the level
+  // goes to every thread, for any thread still on Custom.
+  const leavesCustom = approvalMode !== undefined && approvalMode !== "custom" &&
+    (approvalModeFor(currentBot ?? {}) === "custom" ||
+      (applyToAllThreads === true && threadApprovalModes(currentBot ?? {}).includes("custom")));
   const viaBridge = approvalMode === "custom" || leavesCustom ||
     (approvalMode === "full" && trustedApprovals !== undefined);
 
@@ -2973,7 +2988,7 @@ export async function persistBotUpdate(
         approvalMode === undefined ? ordinaryPatch : {
           ...ordinaryPatch,
           approvalMode,
-          ...(approvalMode === "full" && applyToAllThreads ? { applyToAllThreads: true } : {}),
+          ...(applyToAllThreads ? { applyToAllThreads: true } : {}),
         },
       ),
       signal,
@@ -3102,7 +3117,7 @@ export function runtimeFrameAction(event: RuntimeEvent): Action | null {
     : null;
 }
 
-const StoreContext = createContext<{
+export const StoreContext = createContext<{
   state: AppState;
   dispatch: React.Dispatch<Action>;
   /** Commit any debounced profile edits before an operation reads the bot. */
@@ -4512,12 +4527,6 @@ export function useStore() {
   const ctx = useContext(StoreContext);
   if (!ctx) throw new Error("useStore outside provider");
   return ctx;
-}
-
-/** The app config where a store is mounted; null for a component rendered
- * on its own (static markup, previews). */
-export function useOptionalConfig() {
-  return useContext(StoreContext)?.state.config ?? null;
 }
 
 /** Scoped state for an unsaved editor. The parent workspace remains intact. */

@@ -207,7 +207,7 @@ export interface SendTurnInput {
      * registers the helper with its engine; the harness only ever observes
      * and injects context through this channel, never decides state. */
     hooks?: { url: string; token: string };
-    /** Peer-agent comms: an MCP proxy (list_bots / ask_bot) that routes back
+    /** Peer-agent comms: an MCP proxy (list_bots / coordinate_bots) that routes back
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */
     agents?: { command: string; args: string[]; env: Record<string, string> };
@@ -600,10 +600,11 @@ export interface ProviderInstance {
    * The signal is a best-effort cap: drivers that can honor it abort the
    * underlying provider call; the rest keep their own timeout. */
   generateText?(prompt: string, options?: TextGenerationOptions): Promise<string>;
-  /** A one-shot text call for memory upkeep only, on an engine whose turns
-   * are a whole agent process (the ACP family). It starts a fresh tool-free
-   * session on the engine's own provider, so it is never offered to titles or
-   * compaction, which would then spawn a process for every new chat. */
+  /** A one-shot text call for the background steps only (memory upkeep, the
+   * skill review), on an engine whose turns are a whole agent process (the
+   * ACP family, Codex). It starts a fresh tool-free session on the engine's
+   * own provider, so it is never offered to titles or compaction, which would
+   * then spawn a process for every new chat. */
   generateMemoryText?(prompt: string, options?: TextGenerationOptions): Promise<string>;
   /** Isolated, tool-free permission review on this same provider. Kept
    * separate from generateText so the UI never infers a security capability

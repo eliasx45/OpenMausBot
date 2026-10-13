@@ -40,9 +40,15 @@ at a time with the same request and checks as each bot's own settings. A bot
 that is working, or whose engine does not offer the level, model or effort,
 is skipped and the summary gives the reason. A skipped bot is not changed
 later: once its turn ends, run the team change again or set that bot in its
-own settings. Choosing Auto for a bot on this computer shows the same warning
-as its own settings. Model changes keep each bot on its own engine. Custom
-stays a per-bot setting.
+own settings. A level reaches each bot and every one of its threads, the same
+way for every level, so a thread opened with New thread moves too; a bot is
+"already set" only when all of its threads are. Choosing Auto for a bot on
+this computer shows the same warning as its own settings. Model changes keep
+each bot on its own engine and move the threads that use the bot's model; a
+thread with a model of its own keeps it, including the one open on screen
+(the bot's own settings, by contrast, move that thread with the bot). Custom
+stays a per-bot setting: a bot or thread on Custom leaves it only in the
+desktop app.
 
 Full access does not bypass operating system privacy controls,
 authentication, CAPTCHA or MFA, service permissions,
@@ -68,8 +74,7 @@ when such a turn asked.
 Approvals were where a team's owner spent their day: every teammate a Chief
 brought in started at "Ask for approval", so the owner either answered a card
 every few minutes or switched each new thread by hand. So **a Chief of Staff's
-level flows down**. Work it hands out with `coordinate_bots` (and, for one
-release, its `delegate_bot` and peer `start_thread` aliases) — into the work
+level flows down**. Work it hands out with `coordinate_bots` — into the work
 thread the Chief's conversation has with a teammate, or a fresh thread with
 `thread: "new"` — starts at the level of the Chief conversation it came from:
 Auto-accept edits, Approve for me, or Full access. The teammate's thread is
@@ -210,8 +215,7 @@ silently substitute unrestricted access when a mode is rejected.
 
 OpenMausBot's built-in agents MCP server describes its scoped reads with
 explicit read-only, non-destructive, idempotent, closed-world metadata:
-`list_bots`, `list_rooms`, `list_threads`, `assignment_status` (and its
-deprecated aliases `check_delegation` and `wait_delegation`),
+`list_bots`, `list_rooms`, `list_threads`, `assignment_status`,
 `session_search`, `session_read`, `list_routines`, and `skills_list`.
 Session recall still enforces own-bot access and records its existing room
 disclosure audit. These hints do not grant access to another bot's conversations.

@@ -223,6 +223,10 @@ it("survives a real server crash: queued sends keep receipts, cancellation and u
       expect.objectContaining({ role: "user", text: "Reply to a message that disappears", sender: PAIRED }),
     ]);
     expect((await api("POST", `/api/bots/${bot.id}/messages`, cancelledBody, 409)).error).toContain("cancelled");
+    // The crash cut the bot's turn while the person's next words waited
+    // behind it: the restart policy ends that cut turn with the interrupted
+    // line instead of rerunning it (#2735: the pending words carry the
+    // conversation on), and the held line runs once.
     expect(prompts(bot.threadId)).toHaveLength(2);
     expect(prompts(bot.threadId)[1].message.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "image" })]));
 
@@ -240,6 +244,9 @@ it("survives a real server crash: queued sends keep receipts, cancellation and u
       expect.objectContaining({ kind: "activity", tool: { name: expect.stringContaining("Review the result"), ok: false } }),
     ]);
     expect((await api("POST", `/api/bots/${uncertain.id}/messages`, uncertainBody, 202)).message.queueId).toBe(claimed.queueId);
+    // The claim itself is never replayed (one user line, one notice) and
+    // neither is its cut turn: a dispatched follow-up was that turn, so the
+    // restart policy ends it silently (#2735) and nothing runs again.
     expect(prompts(later.threadId)).toHaveLength(1);
     // A second boot must not duplicate recovery notices or replay a claim.
     await waitForExit(restarted, { signal: "SIGTERM" });
