@@ -204,7 +204,7 @@ import { fleetAvailable, fleetSocketPath } from "./fleet-client.ts";
 import { entitled } from "./enterprise.ts";
 import { HOSTED_CONTRACT_HEADER, HOSTED_CONTRACT_METADATA, HOSTED_CONTRACT_VERSION } from "./hosted-contract.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
-import { buildNotification, buildSpendNotification, type Notification } from "./notify.ts";
+import { buildMentionNotification, buildNotification, buildSpendNotification, type Notification } from "./notify.ts";
 import {
   isModelVariant,
   TurnNotStartedError,
@@ -1825,7 +1825,6 @@ function adminAuditRows(
   return rows;
 }
 
-
 /** Who a request is, for the usage ledger: a paired or signed-in person, or
  * this machine. Captured when the message is accepted and carried with it. */
 function usageTriggerFor(auth: RequestAuth): UsageTrigger {
@@ -2503,7 +2502,6 @@ function agentsIntegration(
   };
 }
 
-
 /** Engine lifecycle hooks (item 0.2): a turn-scoped bearer the engine's hook
  * helper presents on /api/internal/hook. OMB_HOOKS=0 turns the channel off. */
 const hooksEnabled = () => process.env.OMB_HOOKS !== "0";
@@ -2793,7 +2791,7 @@ const ENDED: ReadonlySet<HandoffView["status"]> = new Set(["completed", "failed"
  * or already had it (the node is queued on it); false when nothing is
  * parked on this card (a Stop cancelled it, or it already ran). */
 function answerCardNode(threadId: string, messageId: string, text: string): boolean {
-  const node = coordinator.all().find((n) => n.threadId === threadId && n.cards?.includes(messageId) && !ENDED.has(n.status));
+  const node = coordinator.active().find((n) => n.threadId === threadId && n.cards?.includes(messageId) && !ENDED.has(n.status));
   if (!node) return false;
   if (coordinator.answerNode(node.id, text)) return true;
   return node.status === "queued";
@@ -2803,7 +2801,7 @@ function answerCardNode(threadId: string, messageId: string, text: string): bool
  * the card can no longer be answered (dismissed): released, so the request
  * does not read as waiting forever. */
 function releaseCardNode(threadId: string, messageId: string, reason: string): void {
-  const live = coordinator.all().filter((n) => n.threadId === threadId && !ENDED.has(n.status));
+  const live = coordinator.active().filter((n) => n.threadId === threadId && !ENDED.has(n.status));
   const node = live.find((n) => n.cards?.includes(messageId) && n.status === "waiting");
   if (!node || live.length !== 1 || coordinator.children(node.id).some((child) => !ENDED.has(child.status))) return;
   if (node.groupId) coordinator.cancelRoom(node.groupId, threadId, reason);
@@ -2819,7 +2817,7 @@ function releaseCardNode(threadId: string, messageId: string, reason: string): v
  * node, which is when the cards are still its own. */
 function stopParkedCards(threadId: string): void {
   const ids = new Set<string>();
-  for (const node of coordinator.all()) {
+  for (const node of coordinator.active()) {
     if (node.threadId !== threadId || !(node.status === "waiting" || node.status === "queued")) continue;
     for (const id of node.cards ?? []) ids.add(id);
   }
@@ -2841,11 +2839,11 @@ function stopParkedCards(threadId: string): void {
  * a root waiting on teammates or parked on cards holds nothing back (a
  * typed line there is its own turn, decision 3). */
 function directRootQueued(threadId: string): boolean {
-  return coordinator.all().some((n) => !n.parentId && !n.groupId && n.threadId === threadId && n.status === "queued");
+  return coordinator.active().some((n) => !n.parentId && !n.groupId && n.threadId === threadId && n.status === "queued");
 }
 
 function directRootPending(threadId: string): boolean {
-  return coordinator.all().some((n) => !n.parentId && !n.groupId && n.threadId === threadId &&
+  return coordinator.active().some((n) => !n.parentId && !n.groupId && n.threadId === threadId &&
     (n.status === "waiting" || n.status === "resume" || n.status === "queued"));
 }
 
@@ -2855,7 +2853,7 @@ function directRootPending(threadId: string): boolean {
  * teammates (a typed line starts a new root there, decision 3). */
 function awaitingTeammates(threadId: string): boolean {
   if (coordinator.outstandingDirect(threadId).length > 0) return true;
-  return coordinator.all().some((n) => !n.parentId && !n.groupId && n.threadId === threadId &&
+  return coordinator.active().some((n) => !n.parentId && !n.groupId && n.threadId === threadId &&
     (n.status === "resume" || (n.status === "waiting" && n.question === undefined && !n.cards?.length)));
 }
 function settleDirectFollowup(generation: string | undefined, outcome: DirectTurnOutcome = { ok: false, text: "The coordinated turn was interrupted" }): void {
@@ -5871,7 +5869,7 @@ function publicGroupState(record: GroupRecord): WireGroup {
   try { usage = groupUsageReader.forThread(group.threadId); } catch { /* accounting must not block chat */ }
   // A member's node parked on the person's cards holds nothing and is not
   // working: the room keeps taking messages while that member waits.
-  const openHandoffs = coordinator.all().filter(n => n.groupId === group.id && !ENDED.has(n.status) && !(n.status === "waiting" && n.cards?.length));
+  const openHandoffs = coordinator.active().filter(n => n.groupId === group.id && !ENDED.has(n.status) && !(n.status === "waiting" && n.cards?.length));
   // A task works while a turn runs in it or its hand-offs are still out: its
   // composer locks on this, so another task stays free to talk in.
   const tasks = store.groupTasks(record.id).map((task) => {
@@ -9662,6 +9660,8 @@ bus.subscribe((event: RuntimeEvent) => {
           });
         }
         liveTurnByThread.delete(event.threadId);
+        if (event.ok && !stopped && !group.dm && speakingBot) notify(buildMentionNotification({ bot: { ...speakingBot, threadId: event.threadId }, group, turnId: completedTurnId, reply,
+          messages: store.activePath(event.threadId), members: group.memberIds.map((id) => store.bot(id)), profileName: cfg.profile?.name }));
       }
       if (speaker) {
         releaseTurnResources(turnResourceOwners.get(event.threadId));
@@ -9774,7 +9774,7 @@ function handoffOpener(capability: Pick<InternalCapability, "botId" | "threadId"
  * "source"/"running" then and its children are what tells. */
 function runtimeWorkPending(threadId: string): boolean {
   if (coordinator.outstandingFor(threadId).length > 0) return true;
-  return coordinator.all().some(root => !root.parentId && !root.groupId && root.threadId === threadId
+  return coordinator.active().some(root => !root.parentId && !root.groupId && root.threadId === threadId
     && (root.status === "waiting" || root.status === "resume"
       || ((root.status === "source" || root.status === "running")
         && coordinator.children(root.id).some(child => child.reply !== "none" && child.createdAt >= (root.startedAt ?? 0)))));
@@ -13642,7 +13642,7 @@ roomHandoffTimer.unref();
  * still open stays answerable. Writes the cards' flags the live paths write,
  * once (decision 14). */
 function reconcileParkedRoots(): void {
-  for (const node of coordinator.all()) reconcileParkedNode(node);
+  for (const node of coordinator.active()) reconcileParkedNode(node);
 }
 // The room-context window IS the drain's coalescing cap: a burst longer
 // than the window would append transcript lines the responder never reads,
@@ -14416,7 +14416,7 @@ async function runClaimedGroupMemberTurn(
     bot.description && `About: ${bot.description}`,
     `Room members: ${roster}, and ${userName} (the human).`,
     readyGroup.bulletin.trim() && `Room bulletin (shared instructions for everyone):\n${readyGroup.bulletin.trim()}`,
-    `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.`,
+    `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.${readyGroup.dm ? "" : ` To get ${userName}'s attention or ask them something blocking, write @you.`}`,
     outsideRoom.length > 0 && roomPeerRosterSystemPrompt(outsideRoom),
     integrations.agents && (CREDENTIAL_PROMPT + (orchestration && !orchestration.roomHandoffId ? THREADS_PROMPT : "")).trim(),
     integrations.agents && (!orchestration || orchestration.roomHandoffId) && "For actual OpenMausBot teamwork, discover IDs with list_room_targets and use coordinate_bots for advice or work in this or another room. Do not substitute native coding helpers for these named bots. Consult only when needed to make a decision; no discussion step is mandatory. Give concrete responsibilities, exact accessible paths and acceptance checks. End your turn after assigning; busy teammates queue and results automatically resume you. When they return, finish the requested verification and give the user one final answer. Native helper names are not evidence that an OpenMausBot teammate participated. Plain @mentions are only for conversational replies in this room.",
@@ -22060,7 +22060,7 @@ function noteTurnsCutByShutdown(): void {
 /** A root in this thread (a bot's or a room's) the runtime still holds:
  * what a restart does to it, the runtime says, in this thread, once. */
 function runtimeHoldsRoot(threadId: string): boolean {
-  return coordinator.all().some((n) => !n.parentId && n.threadId === threadId && !ENDED.has(n.status));
+  return coordinator.active().some((n) => !n.parentId && n.threadId === threadId && !ENDED.has(n.status));
 }
 
 const gracefulShutdown = createGracefulShutdown({

@@ -172,8 +172,8 @@ interface ChatRows {
   hasMore: boolean;
   /** Every bot, for who wrote a relayed line or sits across a bot⇄bot chip. */
   bots: readonly Bot[];
-  /** Every other bot, for @mentions. */
-  mentionPeers: readonly Bot[];
+  /** Every other bot, and the person's own tag (`@you`, their name), for @mentions. */
+  mentionPeers: readonly Bot[]; mentionPerson: { profileName?: string };
   /** A search hit or jump target in this thread. */
   focus: AppState["focusMessage"];
   showToolCalls: boolean;
@@ -518,7 +518,7 @@ const Bubble = memo(function Bubble({
   replyTarget?: Message;
   onReply: (message: Message) => void;
 }) {
-  const { botId, threadId, botName, voiceId, tts, localVoice, busy, mentionPeers, focus, dispatch, onBranch, bubbleStyle } = useChatRows();
+  const { botId, threadId, botName, voiceId, tts, localVoice, busy, mentionPeers, mentionPerson, focus, dispatch, onBranch, bubbleStyle } = useChatRows();
   const remoteClient = window.ogb?.remoteClient?.active === true;
   // A user-role line another bot delivered (ask_bot, delegate_bot,
   // start_thread) is that bot speaking, not the person: it takes the
@@ -716,7 +716,7 @@ const Bubble = memo(function Bubble({
               {viewRaw && text ? (
                 <div data-citation-source={message.id} data-citation-owner-type="bot" data-citation-owner={botId} data-citation-thread={threadId}><RawMarkdownView text={text} /></div>
               ) : text ? (
-                <div data-citation-source={message.id} data-citation-owner-type="bot" data-citation-owner={botId} data-citation-thread={threadId}><ChatMarkdown text={text} mentionPeers={mentionPeers} message={{ threadId, messageId: message.id }} delivered={group?.delivered} /></div>
+                <div data-citation-source={message.id} data-citation-owner-type="bot" data-citation-owner={botId} data-citation-thread={threadId}><ChatMarkdown text={text} mentionPeers={mentionPeers} mentionPerson={mentionPerson} message={{ threadId, messageId: message.id }} delivered={group?.delivered} /></div>
               ) : null}
               {group && <AttachmentGallery images={group.images} files={group.files} message={{ threadId, messageId: message.id }} eager={eagerAttachments} beneath />}
             </MessageBoundary>
@@ -1282,8 +1282,8 @@ export function ChatView({ bot: profile }: { bot: Bot }) {
   const bubbleStyle = useMemo(() => (colorMine ? userBubbleStyle(bot.color) : undefined), [colorMine, bot.color]);
   const hasMore = Boolean(bot.hasMore);
   const rows = useMemo<ChatRows>(
-    () => ({ botId: bot.id, threadId: bot.threadId, botName: bot.name, voiceId: bot.voice, tts, localVoice, busy, hasMore, bots, mentionPeers, focus, showToolCalls, locale, dispatch, onBranch, bubbleStyle }),
-    [bot.id, bot.threadId, bot.name, bot.voice, tts, localVoice, busy, hasMore, bots, mentionPeers, focus, showToolCalls, locale, dispatch, onBranch, bubbleStyle],
+    () => ({ botId: bot.id, threadId: bot.threadId, botName: bot.name, voiceId: bot.voice, tts, localVoice, busy, hasMore, bots, mentionPeers, mentionPerson: { profileName: state.config?.profile?.name }, focus, showToolCalls, locale, dispatch, onBranch, bubbleStyle }),
+    [bot.id, bot.threadId, bot.name, bot.voice, tts, localVoice, busy, hasMore, bots, mentionPeers, state.config?.profile?.name, focus, showToolCalls, locale, dispatch, onBranch, bubbleStyle],
   );
   // Where this conversation works, for the place icon on screen and page tools.
   const place = effectivePlace(bot, bot.tasks?.find((task) => task.threadId === bot.threadId));
