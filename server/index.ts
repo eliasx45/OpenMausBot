@@ -8,6 +8,7 @@ import { writeFileAtomic } from "./atomic.ts";
 import { rm as removeDirectory } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { ToolResults, TOOL_RESULT_MAX_CHARS } from "./tool-results.ts";
+import { fixHintFor, HINT_PREFIX } from "./tool-hints.ts";
 import { extname, join } from "node:path";
 import { authorizeExternalRuntime, externalRuntimeIsActive, type ExternalRuntimeGrant } from "./external-runtime.ts";
 
@@ -6268,6 +6269,17 @@ function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: 
     return { ok: true, context };
   }
   if (name === "Stop") return { ok: true };
+  // A failed native tool (Bash, Read, …): a known failure gets its fix hint
+  // beside the error (server/tool-hints.ts). The harness's own tools carry
+  // theirs in the result already, so the same hint is never added twice.
+  if (name === "PostToolUseFailure") {
+    const tool = typeof payload.tool_name === "string" ? payload.tool_name : "";
+    const error = typeof payload.error === "string" ? payload.error : "";
+    if (!tool || !error || payload.is_interrupt === true) return { ok: true, ignored: "failure without a tool error" };
+    const hint = fixHintFor({ tool, text: error });
+    if (!hint || error.includes(hint.hint)) return { ok: true };
+    return { ok: true, hookSpecificOutput: { hookEventName: "PostToolUseFailure", additionalContext: `${HINT_PREFIX}${hint.hint}` } };
+  }
   if (name !== "PostToolUse") return { ok: true, ignored: name || "unknown" };
   const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : "";
   if (!toolUseId) return { ok: true, ignored: "PostToolUse without tool_use_id" };

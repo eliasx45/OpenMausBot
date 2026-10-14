@@ -692,6 +692,13 @@ const playTurn = (prompt: JsonValue, late = false) => {
       out({ type: "assistant", message: { content: [{ type: "tool_use", id, name: call.name, input: call.input }], usage } });
       out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !call.ok, content: call.output }] } });
       runHooks("PostToolUse", { tool_name: call.name, tool_input: call.input, tool_response: call.output, tool_use_id: id });
+      if (!call.ok) {
+        // the real CLI reads additionalContext from a failure hook's
+        // hookSpecificOutput; the fake echoes it into the reply instead
+        const printed = runHooks("PostToolUseFailure", { tool_name: call.name, tool_input: call.input, tool_use_id: id, error: typeof call.output === "string" ? call.output : JSON.stringify(call.output), is_interrupt: false });
+        const context = printed.trim() ? (() => { try { return JSON.parse(printed).hookSpecificOutput?.additionalContext; } catch { return undefined; } })() : undefined;
+        if (typeof context === "string" && context) replyParts = [`${context}\n\n${replyParts[0] ?? ""}`, ...replyParts.slice(1)];
+      }
     }
     for (const text of replyParts) out({ type: "assistant", message: { content: [{ type: "text", text }], usage } });
   } else {
