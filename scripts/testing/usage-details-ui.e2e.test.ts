@@ -65,14 +65,14 @@ if (!enabled) console.log("skipping usage details UI: set OMB_UI_E2E=1 to instal
         return { viewport: innerWidth, scroll: document.documentElement.scrollWidth,
           menu: rect('[role=menu][aria-label=More]'), editor: rect('.mention-editor'),
           row: rect('[data-composer-row]'), controls: rect('[data-composer-actions]'),
-          threads: Boolean(document.querySelector('button[aria-label="All threads"]')) };
+          headerThreads: Boolean(document.querySelector('[data-chathead-controls] button[aria-label="All threads"]')) };
       })()`);
       expect(await evaluate("document.querySelectorAll('[data-chathead-controls] > div').length")).toBeLessThan(6);
       expect(layout.scroll).toBeLessThanOrEqual(width);
       expect(layout.viewport).toBe(width);
       expect(layout.menu.left).toBeGreaterThanOrEqual(0);
       expect(layout.menu.right).toBeLessThanOrEqual(width);
-      expect(layout.threads).toBe(true);
+      expect(layout.headerThreads).toBe(false);
       expect(layout.controls.width).toBeGreaterThan(0);
       if (layout.row.width < 480) {
         expect(layout.editor.width).toBeGreaterThanOrEqual(layout.row.width - 1);
@@ -96,6 +96,7 @@ if (!enabled) console.log("skipping usage details UI: set OMB_UI_E2E=1 to instal
     await ui("press", "--keys", "Escape");
     await expect.poll(() => evaluate("document.querySelector('[data-sidebar]').getBoundingClientRect().width")).toBe(320);
     await ui("click", "--name", "More");
+    await evaluate(`localStorage.setItem("omb-advanced-mode", "1"); window.dispatchEvent(new StorageEvent("storage", { key: "omb-advanced-mode" })); true`);
     await ui("click", "--name", "Inspector");
     await ui("click", "--name", "More");
     const withInspector = await ui("snapshot", "--interactive");

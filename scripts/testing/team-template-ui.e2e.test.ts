@@ -43,6 +43,7 @@ describe("additive template imports in the real renderer", () => {
     await control("new-bot", "--name", "Personal helper", "--section", "Personal");
     await control("send", "--bot", info!.botId, "--text", "Keep this original conversation after importing templates.");
     expect(await control("wait", "--bot", info!.botId, "--timeout", "30")).toMatchObject({ status: "settled" });
+    await expect.poll(async () => (await api("/api/bots")).bots.find((bot: { id: string }) => bot.id === info!.botId)?.unread).toBe(false);
     const original = await api("/api/bots");
     const transcript = await control("messages", "--bot", info!.botId, "--limit", "10");
     const manifest = { format: "openmaus.team", version: 2, team: { name: "Sales crew", members: [
