@@ -498,7 +498,8 @@ it.each([
     // the refusal names who the caller can reach, with the ids to copy
     expect(refused.startsWith(`No bot with id or name "${botId}" — call list_bots and copy the exact id from the result. You can reach: `)).toBe(true);
     expect(refused).toContain(`${f.target.name} (id ${f.target.id})`);
-    expect(refused.endsWith(` ${PEER_ACCESS_HELP}`)).toBe(true);
+    expect(refused).toContain(` ${PEER_ACCESS_HELP}`);
+    expect(refused).toContain("Hint: In a room");
   }
 }), 45_000);
 
