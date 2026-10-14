@@ -74,6 +74,9 @@ export interface TaskOpenedBy {
   /** The opener's own conversation this "work" thread was opened from.
    * Everything that conversation later sends this bot continues here. */
   threadId?: string;
+  /** A parallel room job's thread: `threadId` is the room thread it was
+   * sent from, and the member must stay in that room (server/host/room-jobs.ts). */
+  roomLane?: true;
   at: number;
 }
 
@@ -781,6 +784,27 @@ export interface WireGroup {
   /** Room messages addressed to a member while it was held, by bot id;
    * its next turn is shown them, then they are cleared. */
   heldMessages?: Record<string, RoomHeldMessage[]>;
+  /** transient: who waits in each of the room's threads, and on whom
+   * (server/room-queue.ts). Same-room speakers take turns; absent or empty
+   * when no thread has anyone waiting. */
+  queue?: RoomQueueEntry[];
+}
+
+/** One member's place in a room thread's line of work: "Queued · waiting
+ * for Ada (2 of 5)". */
+export interface RoomQueueEntry {
+  botId: string;
+  /** The room thread whose line this is. */
+  threadId: string;
+  state: "running" | "queued";
+  /** 1-based place in that thread's line; `of` counts the whole line. */
+  position: number;
+  of: number;
+  /** Who a queued member waits on: the member running now, else the one
+   * speaking (or the one ahead). */
+  waitingForBotId?: string;
+  /** The assignment, for work handed out with coordinate_bots. */
+  assignmentId?: string;
 }
 
 /** One member's hold in a room: when the person stopped it, and whether the
