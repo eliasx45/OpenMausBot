@@ -15,6 +15,7 @@ export interface SkillShareRecord {
   library: "installed" | "deduplicated" | "assigned" | "updated";
   /** The library SKILL.md sha256 this share left. */
   sha256: string;
+  referencesSha256?: string;
   sharedAt: number;
   /** Bots this share assigned the skill to. */
   assigned: Array<{ botId: string; name: string }>;

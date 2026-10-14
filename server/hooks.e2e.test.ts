@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { freePortBlock } from "./testing/ports.ts";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -24,8 +25,8 @@ interface Msg {
 const BIG = `line ${"x".repeat(80)}\n`.repeat(200); // ~17 KB: past the 6 KB preview
 
 function harness(label: string, serverEnv: Record<string, string>, instanceEnv: Record<string, string> = {}) {
-  const PORT = 18800 + Math.floor(Math.random() * 10_000);
-  const BASE = `http://127.0.0.1:${PORT}`;
+  let PORT: number;
+  let BASE: string;
   let child: ChildProcess;
   let home: string;
   let stderr = "";
@@ -46,6 +47,8 @@ function harness(label: string, serverEnv: Record<string, string>, instanceEnv: 
     }
   };
   beforeAll(async () => {
+    PORT = await freePortBlock([0, 1]);
+    BASE = `http://127.0.0.1:${PORT}`;
     chmodSync(FAKE_CLAUDE, 0o755);
     home = mkdtempSync(join(tmpdir(), `omb-hooks-${label}-`));
     mkdirSync(join(home, ".openmausbot"), { recursive: true });
@@ -67,7 +70,7 @@ function harness(label: string, serverEnv: Record<string, string>, instanceEnv: 
         },
       },
     }));
-    const env: NodeJS.ProcessEnv = { HOME: home, USERPROFILE: home, OMB_PORT: String(PORT), ...serverEnv };
+    const env: NodeJS.ProcessEnv = { HOME: home, USERPROFILE: home, OMB_PORT: String(PORT), OMB_WEBHOOK_PORT: String(PORT + 1), ...serverEnv };
     if (process.env.PATH) env.PATH = process.env.PATH;
     child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], { cwd: join(SERVER_DIR, ".."), env, stdio: ["ignore", "pipe", "pipe"] });
     child.stderr!.on("data", (c) => (stderr += c));

@@ -1,3 +1,4 @@
+import { learnedSkillDirectoryMatches } from "./skill-content.ts";
 // Per-bot skill copies move into the shared library; originals are archived write-once, and a manifest entry is dropped only after its archive and assignment are durable.
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";
@@ -10,7 +11,7 @@ import {
   readSkillLibraryIndex,
   skillsLibraryRoot,
 } from "./skill-library.ts";
-import { listMigratableSkills, removeManifestEntry } from "./skills.ts";
+import { listMigratableSkills, readSkillReferences, removeManifestEntry } from "./skills.ts";
 
 export interface SkillMigrationOutcome {
   botId: string;
@@ -29,7 +30,7 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-export function archiveSkillDirectory(source: string, archive: string, expectSha256: string): void {
+export function archiveSkillDirectory(source: string, archive: string, expectSha256: string, expectReferencesSha256?: string): void {
   mkdirSync(dirname(archive), { recursive: true, mode: 0o700 });
   let destination = archive;
   if (existsSync(destination)) {
@@ -44,8 +45,7 @@ export function archiveSkillDirectory(source: string, archive: string, expectSha
     if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
     cpSync(source, destination, { recursive: true, force: false, errorOnExist: true });
   }
-  const archived = readFileSync(join(destination, "SKILL.md"), "utf8");
-  if (sha256Hex(archived) !== expectSha256) {
+  if (!learnedSkillDirectoryMatches(destination, expectSha256, expectReferencesSha256)) {
     throw new Error("the archived copy does not match the reviewed sha256");
   }
 }
@@ -58,13 +58,13 @@ export function migrateBotSkillsToLibrary(botId: string, root: string = skillsLi
       outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: "stored SKILL.md is missing or changed after review" });
       continue;
     }
-    try {
-      if (readdirSync(copy.directory).some((name) => name !== "SKILL.md")) {
-        outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: "skill has auxiliary files — keeping its complete private directory" });
-        continue;
-      }
-    } catch {
-      outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: "could not inspect the private skill directory" });
+    if (!learnedSkillDirectoryMatches(copy.directory, copy.sha256, copy.referencesSha256)) {
+      outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: "skill has unreviewed auxiliary files — keeping its complete private directory" });
+      continue;
+    }
+    const references = readSkillReferences(botId, copy.name);
+    if (references === null) {
+      outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: "stored skill references changed after review" });
       continue;
     }
     let instructions: string;
@@ -79,7 +79,7 @@ export function migrateBotSkillsToLibrary(botId: string, root: string = skillsLi
       continue;
     }
     const existing = readSkillLibraryIndex(root)[copy.name];
-    if (existing && existing.sha256 !== copy.sha256) {
+    if (existing && (existing.sha256 !== copy.sha256 || existing.referencesSha256 !== copy.referencesSha256)) {
       outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: `the library already has a different "${copy.name}" — rename one of them` });
       continue;
     }
@@ -98,6 +98,7 @@ export function migrateBotSkillsToLibrary(botId: string, root: string = skillsLi
         name: copy.name,
         description: copy.description,
         instructions,
+        references,
         source: copy.source,
         license: copy.license,
         compatibility: copy.compatibility,
@@ -125,12 +126,12 @@ export function migrateBotSkillsToLibrary(botId: string, root: string = skillsLi
       continue;
     }
     try {
-      archiveSkillDirectory(copy.directory, libraryArchiveDirectory(root, botId, copy.name), copy.sha256);
+      archiveSkillDirectory(copy.directory, libraryArchiveDirectory(root, botId, copy.name), copy.sha256, copy.referencesSha256);
     } catch (error) {
       outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: `archiving failed: ${error instanceof Error ? error.message : String(error)}` });
       continue;
     }
-    const removed = removeManifestEntry(botId, copy.name, copy.sha256);
+    const removed = removeManifestEntry(botId, copy.name, copy.sha256, copy.referencesSha256 ?? null);
     if ("error" in removed) {
       outcomes.push({ botId, name: copy.name, outcome: "skipped", detail: removed.error });
       continue;

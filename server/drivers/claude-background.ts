@@ -17,3 +17,5 @@ export function backgroundCallArgs(input: {
   }
   return args;
 }
+
+export const CLAUDE_BASH_MAX_TIMEOUT_MS = 10 * 60_000;

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { redactSkillRequest } from "./skill-request-redaction.ts";
 import { chmodSync, existsSync, readFileSync, mkdirSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
@@ -195,41 +195,7 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
             : { ...operation },
       };
     }
-    if (card.skillRequest) {
-      const originalPreview = card.skillRequest.preview;
-      const preview = originalPreview === undefined
-        ? undefined
-        : redactSecretsInText(originalPreview);
-      // Keep the digest only when this pass changed nothing and it matches the preview, so a card never shows one SKILL.md and approves another.
-      const previewSha256 = preview !== undefined && preview === originalPreview
-        ? createHash("sha256").update(preview).digest("hex")
-        : undefined;
-      // Reference files ride the same binding: any scrub change makes the
-      // whole card deny-only.
-      const originalReferences = card.skillRequest.references;
-      const references = originalReferences?.map((file) => ({
-        path: redactSecretsInText(file.path),
-        content: redactSecretsInText(file.content),
-      }));
-      const referencesUnchanged = (references ?? []).every((file, index) =>
-        file.path === originalReferences![index]!.path && file.content === originalReferences![index]!.content);
-      const sha256 = card.skillRequest.sha256 !== undefined
-        && card.skillRequest.sha256 === previewSha256
-        && referencesUnchanged
-        ? card.skillRequest.sha256
-        : undefined;
-      card.skillRequest = {
-        ...card.skillRequest,
-        gist: redactSecretsInText(card.skillRequest.gist),
-        source: card.skillRequest.source === undefined
-          ? undefined
-          : redactSecretsInText(card.skillRequest.source),
-        preview,
-        sha256,
-        ...(references ? { references } : {}),
-        warnings: card.skillRequest.warnings.map((warning) => redactSecretsInText(warning)),
-      };
-    }
+    if (card.skillRequest) card.skillRequest = redactSkillRequest(card.skillRequest);
     if (card.profileRequest) {
       const scrubChanges = (changes: ProfileRequestChanges): ProfileRequestChanges => {
         const out = { ...changes };

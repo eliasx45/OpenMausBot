@@ -1,3 +1,4 @@
+import { publishReviewedRevision } from "./skill-revision.ts";
 // Imports review SKILL.md only; learned references are reviewed and hash-bound with it.
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -27,7 +28,9 @@ import { redactSecretsInText } from "./redact.ts";
 import { LEARN_SOURCE_PREFIX } from "./skill-learn.ts";
 import { libraryDescriptionsAt, librarySkillFilePath, listLibrarySkills, type LibrarySkillListing } from "./skill-library.ts";
 import { workspaceDir } from "./workspace.ts";
-import { isSkillName, parseSkillMd, scanSkillText, SKILL_FILE_MAX_BYTES, type ParsedSkill } from "../shared/skill-md.ts";
+import { isSkillName, parseSkillMd, SKILL_FILE_MAX_BYTES } from "../shared/skill-md.ts";
+import { STAGED_SKILL_FILE_MAX_BYTES, isSkillReferencePath, skillReferencesSha256, formatKb, REFERENCES_ADVICE, directoryEntryState, preparedSkillFiles, preparedLearnedSkill, readReferenceFiles, learnedSkillDirectoryMatches, type PreparedSkillFiles } from "./skill-content.ts";
+export { STAGED_SKILL_FILE_MAX_BYTES, MAX_SKILL_REFERENCES, isSkillReferencePath, skillReferencesSha256, preparedLearnedSkill } from "./skill-content.ts";
 import { parseSkillCommand } from "../shared/skill-command.ts";
 
 export {
@@ -45,39 +48,6 @@ export const INDEX_MAX_BYTES = 4_000;
 const loggedIndexOmissions = new Map<string, string>();
 export const MAX_STAGED_SKILLS = 20;
 export const STAGED_GIST_MAX = 240;
-export const STAGED_SKILL_FILE_MAX_BYTES = 32 * 1024;
-/** A learned skill may keep detail in a few references/<topic>.md files next
- * to SKILL.md, linked from it and read only when a task needs them. Each one
- * has the SKILL.md cap, so the review card stays bounded. */
-export const MAX_SKILL_REFERENCES = 8;
-const SKILL_REFERENCE_PATH = /^references\/[a-z0-9][a-z0-9-]{0,63}\.md$/;
-
-export function isSkillReferencePath(path: string): boolean {
-  return SKILL_REFERENCE_PATH.test(path);
-}
-
-/** One hash over a learned skill's reference files (paths and bytes), or
- * undefined when it has none. SKILL.md keeps its own sha256. */
-export function skillReferencesSha256(files: ReadonlyArray<{ path: string; content: string | Buffer }>): string | undefined {
-  const references = files
-    .filter((file) => file.path !== "SKILL.md")
-    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  if (!references.length) return undefined;
-  const hash = createHash("sha256");
-  for (const file of references) {
-    hash.update(`${file.path}\0${createHash("sha256").update(file.content).digest("hex")}\n`);
-  }
-  return hash.digest("hex");
-}
-
-function formatKb(bytes: number): string {
-  return `${(bytes / 1024).toFixed(1)}KB`;
-}
-
-const REFERENCES_ADVICE =
-  "Keep SKILL.md to the core steps and move detail (long rule lists, examples, lookup tables) into " +
-  "references/<topic>.md files inside the skill — pass them as skill_manage references — then link each one " +
-  "from SKILL.md, for example \"For edge cases, read references/<topic>.md.\"";
 
 interface SkillManifestEntry {
   description: string;
@@ -136,17 +106,6 @@ const managedLinksSchema = z.array(z.string());
 
 function skillsDir(botId: string): string {
   return join(workspaceDir(botId), "skills");
-}
-
-type DirectoryEntryState = "missing" | "directory" | "unsafe";
-
-function directoryEntryState(path: string): DirectoryEntryState {
-  try {
-    const stat = lstatSync(path);
-    return stat.isDirectory() && !stat.isSymbolicLink() ? "directory" : "unsafe";
-  } catch {
-    return "missing";
-  }
 }
 
 function existingSkillsRoot(botId: string): string | null {
@@ -787,124 +746,6 @@ function writeStaged(botId: string, store: StagedStore): void {
   writeFileAtomic(stagedPath(botId), `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
 }
 
-interface PreparedSkillFiles {
-  files: Array<{ path: string; content: string }>;
-  parsed: ParsedSkill;
-  warnings: string[];
-  skippedFiles: string[];
-}
-
-function preparedSkillFiles(
-  files: Array<{ path: string; content: string }>,
-): PreparedSkillFiles | { error: string } {
-  const skillMd = files.find((file) => file.path === "SKILL.md" || file.path.endsWith("/SKILL.md"));
-  if (!skillMd) return { error: "no SKILL.md found at that location" };
-  if (Buffer.byteLength(skillMd.content, "utf8") > SKILL_FILE_MAX_BYTES) {
-    return { error: `SKILL.md is larger than ${SKILL_FILE_MAX_BYTES / 1024}KB` };
-  }
-  const parsed = parseSkillMd(skillMd.content);
-  if ("error" in parsed) return parsed;
-  const prefix = skillMd.path.slice(0, skillMd.path.length - "SKILL.md".length);
-  const skippedFiles = [
-    ...new Set(
-      files
-        .filter((file) => file !== skillMd)
-        .map((file) => {
-          const relative = file.path.startsWith(prefix) ? file.path.slice(prefix.length) : file.path;
-          return relative || file.path;
-        }),
-    ),
-  ];
-  const warnings = [
-    ...scanSkillText(skillMd.content),
-    ...skippedFiles.map((path) => `skipped supporting file "${path}" — v1 imports only SKILL.md`),
-  ];
-  return { files: [{ path: "SKILL.md", content: skillMd.content }], parsed, warnings, skippedFiles };
-}
-
-function referenceLimitError(files: Array<{ path: string; content: string }>): string | null {
-  const references = files.filter((file) => file.path !== "SKILL.md");
-  for (const file of references) {
-    if (!isSkillReferencePath(file.path)) {
-      return `learned skill files must be SKILL.md or references/<topic>.md (lowercase letters, digits, and hyphens), not "${file.path}"`;
-    }
-    const bytes = Buffer.byteLength(file.content, "utf8");
-    if (bytes > STAGED_SKILL_FILE_MAX_BYTES) {
-      return `${file.path} must be at most ${STAGED_SKILL_FILE_MAX_BYTES / 1024}KB; it is ${formatKb(bytes)}. Split it into more references/<topic>.md files.`;
-    }
-  }
-  if (new Set(references.map((file) => file.path)).size !== references.length) {
-    return "each references/<topic>.md file may appear only once";
-  }
-  if (references.length > MAX_SKILL_REFERENCES) {
-    return `a learned skill may have at most ${MAX_SKILL_REFERENCES} references/<topic>.md files; it would have ${references.length}. Merge related topics.`;
-  }
-  return null;
-}
-
-/** A learned skill is SKILL.md plus at most MAX_SKILL_REFERENCES
- * references/<topic>.md files, all reviewed together. SKILL.md comes first;
- * references follow in path order. */
-export function preparedLearnedSkill(
-  files: Array<{ path: string; content: string }>,
-): PreparedSkillFiles | { error: string } {
-  const skillMds = files.filter((file) => file.path === "SKILL.md");
-  if (skillMds.length !== 1 || files.some((file) => file.path !== "SKILL.md" && file.path.endsWith("SKILL.md"))) {
-    return { error: "learned skills must contain exactly one SKILL.md" };
-  }
-  const limitError = referenceLimitError(files);
-  if (limitError) return { error: limitError };
-  const prepared = preparedSkillFiles([skillMds[0]!]);
-  if ("error" in prepared) return prepared;
-  const references = files
-    .filter((file) => file.path !== "SKILL.md")
-    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
-    .map((file) => ({ path: file.path, content: file.content }));
-  return {
-    ...prepared,
-    files: [prepared.files[0]!, ...references],
-    warnings: [
-      ...prepared.warnings,
-      ...references.flatMap((file) => scanSkillText(file.content).map((warning) => `${file.path}: ${warning}`)),
-    ],
-  };
-}
-
-/** The reference files under a learned skill directory, or null when that
- * directory is not exactly what review could have produced. */
-function readReferenceFiles(directory: string): Array<{ path: string; content: string }> | null {
-  const references = join(directory, "references");
-  if (directoryEntryState(references) !== "directory") return null;
-  const names = readdirSync(references).sort();
-  if (!names.length || names.length > MAX_SKILL_REFERENCES) return null;
-  const files: Array<{ path: string; content: string }> = [];
-  for (const name of names) {
-    const path = `references/${name}`;
-    if (!isSkillReferencePath(path)) return null;
-    const stat = lstatSync(join(references, name));
-    if (!stat.isFile() || stat.size > STAGED_SKILL_FILE_MAX_BYTES) return null;
-    files.push({ path, content: readFileSync(join(references, name), "utf8") });
-  }
-  return files;
-}
-
-function learnedSkillDirectoryMatches(directory: string, sha256: string, referencesSha256?: string): boolean {
-  if (directoryEntryState(directory) !== "directory") return false;
-  try {
-    const entries = readdirSync(directory).sort();
-    const expected = referencesSha256 ? ["SKILL.md", "references"] : ["SKILL.md"];
-    if (entries.length !== expected.length || entries.some((entry, index) => entry !== expected[index])) return false;
-    const file = join(directory, "SKILL.md");
-    if (!lstatSync(file).isFile()) return false;
-    if (createHash("sha256").update(readFileSync(file)).digest("hex") !== sha256) return false;
-    if (!referencesSha256) return true;
-    const references = readReferenceFiles(directory);
-    return references !== null && skillReferencesSha256(references) === referencesSha256;
-  } catch {
-    return false;
-  }
-}
-
 /** The reviewed references/<topic>.md files of an installed learned skill:
  * empty when it has none, null when they no longer match review. */
 export function readSkillReferences(botId: string, name: string): Array<{ path: string; content: string }> | null {
@@ -928,103 +769,6 @@ function installedLearnedSkillMatches(
 ): boolean {
   const directory = skillDirectory(botId, name, entry);
   return directory ? learnedSkillDirectoryMatches(directory, entry.sha256, entry.referencesSha256) : false;
-}
-
-function directoryIdentity(path: string): { dev: number; ino: number } | null {
-  try {
-    const stat = lstatSync(path);
-    return stat.isDirectory() && !stat.isSymbolicLink() ? { dev: stat.dev, ino: stat.ino } : null;
-  } catch {
-    return null;
-  }
-}
-
-function sameDirectoryIdentity(path: string, expected: { dev: number; ino: number }): boolean {
-  const current = directoryIdentity(path);
-  return current?.dev === expected.dev && current.ino === expected.ino;
-}
-
-/** The manifest selects this revision in a separate atomic write, so a crash never half-replaces a skill. */
-function publishReviewedRevision(
-  botId: string,
-  stageId: string,
-  files: Array<{ path: string; content: string }>,
-  sha256: string,
-  referencesSha256: string | undefined,
-): string {
-  // No agent-writable path is opened until the complete directory is published as one rename.
-  const state = skillStateDir(botId);
-  mkdirSync(state, { recursive: true, mode: 0o700 });
-  if (directoryEntryState(state) !== "directory") {
-    throw new Error("the protected skill state path is not a real directory");
-  }
-  const preparedRoot = join(state, "reviewed-revisions");
-  const preparedRootState = directoryEntryState(preparedRoot);
-  if (preparedRootState === "unsafe") {
-    throw new Error("the protected revision path is not a real directory");
-  }
-  if (preparedRootState === "missing") mkdirSync(preparedRoot, { mode: 0o700 });
-  const revision = createHash("sha256").update(stageId).digest("hex");
-  const prepared = join(preparedRoot, revision);
-  if (!learnedSkillDirectoryMatches(prepared, sha256, referencesSha256)) {
-    if (entryExistsWithoutFollowing(prepared)) {
-      if (directoryEntryState(prepared) !== "directory") {
-        throw new Error("the protected reviewed revision is not a real directory");
-      }
-      rmSync(prepared, { recursive: true, force: true });
-    }
-    const temporary = join(preparedRoot, `.prepare-${revision}-${randomUUID()}`);
-    try {
-      mkdirSync(temporary, { mode: 0o700 });
-      for (const file of files) {
-        const path = join(temporary, file.path);
-        mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-        writeFileAtomic(path, file.content, { mode: 0o600 });
-      }
-      if (!learnedSkillDirectoryMatches(temporary, sha256, referencesSha256)) {
-        throw new Error("the protected reviewed bytes do not match the approval card");
-      }
-      renameSync(temporary, prepared);
-    } catch (error) {
-      rmSync(temporary, { recursive: true, force: true });
-      throw error;
-    }
-  }
-
-  const root = ensureSkillsRoot(botId);
-  if (!root) throw new Error("the workspace skills path must be a real directory, not a symlink or file");
-  const rootIdentity = directoryIdentity(root);
-  if (!rootIdentity) throw new Error("the workspace skills path changed during update");
-  const revisions = join(root, ".revisions");
-  const revisionsState = directoryEntryState(revisions);
-  if (revisionsState === "unsafe") throw new Error("the skill revisions path is not a real directory");
-  if (revisionsState === "missing") mkdirSync(revisions, { mode: 0o700 });
-  const revisionsIdentity = directoryIdentity(revisions);
-  if (!revisionsIdentity) throw new Error("the skill revisions path could not be created safely");
-
-  const target = join(revisions, revision);
-  if (learnedSkillDirectoryMatches(target, sha256, referencesSha256)) {
-    try {
-      rmSync(prepared, { recursive: true, force: true });
-    } catch {}
-    return revision;
-  }
-  if (entryExistsWithoutFollowing(target)) {
-    throw new Error("the reviewed revision path already exists with different content");
-  }
-  if (!sameDirectoryIdentity(root, rootIdentity) || !sameDirectoryIdentity(revisions, revisionsIdentity)) {
-    throw new Error("the workspace skills path changed during update");
-  }
-
-  renameSync(prepared, target);
-  if (
-    !sameDirectoryIdentity(root, rootIdentity) ||
-    !sameDirectoryIdentity(revisions, revisionsIdentity) ||
-    !learnedSkillDirectoryMatches(target, sha256, referencesSha256)
-  ) {
-    throw new Error("the reviewed revision changed while it was being published");
-  }
-  return revision;
 }
 
 function commitNewSkillFiles(
@@ -1164,7 +908,7 @@ function updatePreparedSkill(
     return { error: "the installed skill changed after this update was proposed — review a fresh update" };
   }
   try {
-    const storageRevision = publishReviewedRevision(botId, options.appliedStageId, prepared.files, sha256, referencesSha256);
+    const storageRevision = publishReviewedRevision(skillStateDir(botId), () => ensureSkillsRoot(botId), options.appliedStageId, prepared.files, sha256, referencesSha256);
     const latestManifest = readManifest(botId);
     const latest = latestManifest[name];
     if (
@@ -1574,6 +1318,7 @@ export function listBotSkillsWithOrigin(
 
 export interface MigratableSkillCopy {
   name: string;
+  referencesSha256?: string;
   directory: string | null;
   sha256: string;
   enabled: boolean;
@@ -1591,6 +1336,7 @@ export function listMigratableSkills(botId: string): MigratableSkillCopy[] {
       name,
       directory: skillDirectory(botId, name, entry),
       sha256: entry.sha256,
+      ...(entry.referencesSha256 ? { referencesSha256: entry.referencesSha256 } : {}),
       enabled: entry.enabled,
       source: entry.source,
       description: entry.description,
@@ -1602,12 +1348,12 @@ export function listMigratableSkills(botId: string): MigratableSkillCopy[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function removeManifestEntry(botId: string, name: string, expectSha256: string): { removed: true } | { error: string } {
+export function removeManifestEntry(botId: string, name: string, expectSha256: string, expectReferencesSha256?: string | null): { removed: true } | { error: string } {
   if (!isSkillName(name)) return { error: "invalid skill name" };
   const manifest = readManifest(botId);
   const entry = manifest[name];
   if (!entry) return { removed: true };
-  if (entry.sha256 !== expectSha256) {
+  if (entry.sha256 !== expectSha256 || (expectReferencesSha256 !== undefined && (entry.referencesSha256 ?? null) !== expectReferencesSha256)) {
     return { error: `skill "${name}" changed since it was read — leaving it in place` };
   }
   delete manifest[name];

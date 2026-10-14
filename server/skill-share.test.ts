@@ -315,3 +315,42 @@ describe("prompt-cache safety", () => {
     expect(share.prepareShareNote(other.id, "t", ["a"], 1, [], root).text).toBe("");
   });
 });
+
+
+it("shares reviewed references and preserves them through a reference-only update and undo", () => {
+  const content = SKILL("reference-cut", "Read references/cuts.md before editing.");
+  const references = [{ path: "references/cuts.md", content: "Keep the approved cut." }];
+  const staged = skills.stageSkillWrite(author.id, { action: "create", files: [{ path: "SKILL.md", content }, ...references], source: learnSource("conversation") });
+  if ("error" in staged) throw new Error(staged.error);
+  const applied = skills.applyStagedSkillWrite(author.id, staged.id);
+  if ("error" in applied) throw new Error(applied.error);
+  const shared = share.shareLearnedSkill({ author, bots, name: staged.name, patchAssigned, root, expectSha256: staged.sha256, expectReferencesSha256: staged.referencesSha256 });
+  if ("error" in shared) throw new Error(shared.error);
+  expect(library.readLibrarySkillReferences(staged.name, root)).toEqual(references);
+  expect(readFileSync(join(library.libraryArchiveDirectory(root, author.id, staged.name), references[0].path), "utf8")).toBe(references[0].content);
+  const initialRevision = library.librarySkillRevision(library.readSkillLibraryIndex(root)[staged.name]);
+  const updated = share.updateSharedLearnedSkill({ bot: mate, bots, name: staged.name, skillMd: content,
+    references: [{ path: references[0].path, content: "Keep the new cut." }], expectSha256: initialRevision, patchAssigned, root });
+  if ("error" in updated) throw new Error(updated.error);
+  expect(updated.sha256).toBe(shared.sha256);
+  expect(updated.share.referencesSha256).not.toBe(shared.referencesSha256);
+  expect(share.updateSharedLearnedSkill({ bot: author, bots, name: staged.name, skillMd: content,
+    references, expectSha256: initialRevision, patchAssigned, root })).toHaveProperty("error");
+  expect(share.undoSharedLearnedSkill({ authorId: author.id, name: staged.name, action: "create", share: shared, bots, patchAssigned, root })).toEqual({ stale: true });
+  expect(share.undoSharedLearnedSkill({ authorId: mate.id, name: staged.name, action: "update", share: updated.share, previous: updated.previous, bots, patchAssigned, root })).toEqual({ undone: true });
+  expect(library.readLibrarySkillReferences(staged.name, root)).toEqual(references);
+  writeFileSync(join(library.librarySkillDirectory(root, staged.name), references[0].path), "Changed outside review");
+  expect(library.readLibrarySkillFile(staged.name, root)).toBeNull();
+  expect(library.listLibrarySkills(root).find(skill => skill.name === staged.name)?.enabled).toBe(false);
+});
+
+it("migrates reviewed learned reference files without dropping them", async () => {
+  const { migrateBotSkillsToLibrary } = await import("./skills-library-migration.ts");
+  const files = [{ path: "SKILL.md", content: SKILL("migrated-reference") }, { path: "references/notes.md", content: "Approved notes" }];
+  const staged = skills.stageSkillWrite(author.id, { action: "create", files, source: learnSource("conversation") });
+  if ("error" in staged) throw new Error(staged.error);
+  expect(skills.applyStagedSkillWrite(author.id, staged.id)).not.toHaveProperty("error");
+  const report = migrateBotSkillsToLibrary(author.id, root);
+  expect(report.outcomes[0].outcome).toBe("migrated");
+  expect(library.readLibrarySkillReferences(staged.name, root)).toEqual(files.slice(1));
+});

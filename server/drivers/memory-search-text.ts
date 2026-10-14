@@ -12,3 +12,8 @@ export function memorySearchText(memoryHits: readonly Json[], teamHits: readonly
     : "";
   return team + privateNotes;
 }
+
+export function sessionReadFailure(threadId: string, messageId: string, error: unknown): string {
+  const given = `message ${JSON.stringify(messageId.slice(0, 80))} in thread ${JSON.stringify(threadId.slice(0, 80))}`;
+  return `Couldn't read ${given}: ${error instanceof Error ? error.message : String(error)}. Copy thread_id and message_id exactly from a session_search hit's "thread …" and "message …" fields.`;
+}

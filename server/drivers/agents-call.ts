@@ -2,13 +2,12 @@
 // per-turn limits are the harness's, since one proxy can serve many turns of a warm engine.
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
 import { normalizeCronSchedule } from "../../shared/routine-schedule.ts";
-
 import { peerName } from "../peer-roster.ts";
 import { callCardTool, CARD_TOOL_NAMES } from "./agents-call-cards.ts";
 import { catalogProfileFromEnv, SHARED_COMPUTER_TOOL_NAMES, WEEKDAYS } from "./agents-catalog.ts";
 import { harnessClientFromEnv } from "./agents-client.ts";
 import type { HarnessClient, Json } from "./agents-client.ts";
-import { memorySearchText } from "./memory-search-text.ts";
+import { memorySearchText, sessionReadFailure } from "./memory-search-text.ts";
 import { boundedAgentResult } from "./agents-result.ts";
 
 export interface ToolCallContext {
@@ -1032,9 +1031,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
     try {
       r = await api(`/api/internal/session-read?${query.toString()}`);
     } catch (error) {
-      // Echo the ids it was given, so a mistyped one shows against the hit.
-      const given = `message ${JSON.stringify(messageId.slice(0, 80))} in thread ${JSON.stringify(threadId.slice(0, 80))}`;
-      return { text: `Couldn't read ${given}: ${error instanceof Error ? error.message : String(error)}. Copy thread_id and message_id exactly from a session_search hit's "thread …" and "message …" fields.`, isError: true };
+      return { text: sessionReadFailure(threadId, messageId, error), isError: true };
     }
     const when = recallWhen(r.at, true);
     const readTask = typeof r.task === "string" && r.task ? `task "${r.task}"` : "an earlier task";

@@ -5,7 +5,6 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, wr
 import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname, isAbsolute, normalize } from "node:path";
-
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { openStartupModelCatalog, writeStartupModelCache } from "../startup-model-catalog.ts";
 import { writeFileAtomic, writeFileAtomicIfChanged } from "../atomic.ts";
@@ -44,7 +43,7 @@ import {
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
 import { runKeepWarmPing, type KeepWarmContract } from "./claude-keepwarm.ts";
-import { BACKGROUND_CALL_TIMEOUT_MS, backgroundCallArgs } from "./claude-background.ts";
+import { BACKGROUND_CALL_TIMEOUT_MS, backgroundCallArgs, CLAUDE_BASH_MAX_TIMEOUT_MS } from "./claude-background.ts";
 import { permissionCommand, permissionLaunchCwd } from "./permission-command.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { extractMcpImages } from "../mcp-tool-images.ts";
@@ -557,8 +556,7 @@ export const STEERED_CONTINUATION_GRACE_MS = 2_000;
  * milliseconds) before the turn closes on the held result. */
 export const STEERED_CONTINUATION_SILENCE_MS = 30_000;
 
-export const CLAUDE_BASH_MAX_TIMEOUT_MS = 10 * 60_000;
-
+export { CLAUDE_BASH_MAX_TIMEOUT_MS } from "./claude-background.ts";
 const fakeTimerScale = (name: string) => Number(process.env[name] ?? "1") || 1;
 const steerGraceScale = () => fakeTimerScale("FAKE_CLAUDE_STEER_GRACE_SCALE");
 const steerSilenceScale = () => fakeTimerScale("FAKE_CLAUDE_STEER_SILENCE_SCALE");
@@ -1370,9 +1368,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (authSettingsPath) args.push("--settings", authSettingsPath);
       // Approvals and browser credentials expire at the turn boundary; native background workers must not outlive it.
       env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
-      // With no background shell, a long media job's way past the 2-minute
-      // default is a per-call `timeout`; the prompt promises up to this cap.
-      // A cap the person set themselves wins.
       env.BASH_MAX_TIMEOUT_MS ||= String(CLAUDE_BASH_MAX_TIMEOUT_MS);
       const cwd = turn.cwd ?? homedir();
       const commandCwd = permissionLaunchCwd(cwd);

@@ -5,6 +5,8 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, renameSync } from "node:fs";
 import { z } from "zod";
 
+import { learnedSkillDirectoryMatches, readReferenceFiles, referenceLimitError, skillReferencesSha256 } from "./skill-content.ts";
+import { writeLibraryFiles } from "./skill-library-files.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR, type AppConfig } from "./config.ts";
 import { isSkillName, parseSkillMd, SKILL_FILE_MAX_BYTES } from "../shared/skill-md.ts";
@@ -27,6 +29,7 @@ export interface SkillManifest {
 export interface BundledSkill {
   manifest: SkillManifest;
   instructions: string;
+  references?: Array<{ path: string; content: string }>;
   directory: string;
 }
 
@@ -141,6 +144,7 @@ export interface SkillLibraryEntry {
   description: string;
   source: string;
   sha256: string;
+  referencesSha256?: string;
   importedAt: string;
   reviewState: LibraryReviewState;
   license?: string;
@@ -177,6 +181,7 @@ export interface LibrarySkillListing {
   editable: false;
   source: string;
   sha256: string;
+  referencesSha256?: string;
   importedAt: string;
   license?: string;
   compatibility?: string;
@@ -190,6 +195,7 @@ const skillLibraryEntrySchema = z.object({
   description: z.string(),
   source: z.string(),
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  referencesSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   importedAt: z.string(),
   reviewState: z.enum(["approved", "disabled"]),
   license: z.string().optional(),
@@ -263,14 +269,19 @@ function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+export function librarySkillRevision(entry: { sha256: string; referencesSha256?: string }): string {
+  return entry.referencesSha256 ? sha256Hex(`${entry.sha256}:${entry.referencesSha256}`) : entry.sha256;
+}
+
 function libraryContentMatches(root: string, entry: SkillLibraryEntry): boolean {
-  try {
-    const file = join(librarySkillDirectory(root, entry.name), "SKILL.md");
-    if (!existsSync(file)) return false;
-    return sha256Hex(readFileSync(file, "utf8")) === entry.sha256;
-  } catch {
-    return false;
-  }
+  return learnedSkillDirectoryMatches(librarySkillDirectory(root, entry.name), entry.sha256, entry.referencesSha256);
+}
+
+export function readLibrarySkillReferences(name: string, root: string = skillsLibraryRoot()): Array<{ path: string; content: string }> | null {
+  if (!isSkillName(name)) return null;
+  const entry = readSkillLibraryIndex(root)[name];
+  if (!entry || !libraryContentMatches(root, entry)) return null;
+  return entry.referencesSha256 ? readReferenceFiles(librarySkillDirectory(root, name)) : [];
 }
 
 function librarySkillListing(root: string, entry: SkillLibraryEntry): LibrarySkillListing {
@@ -282,6 +293,7 @@ function librarySkillListing(root: string, entry: SkillLibraryEntry): LibrarySki
     editable: false,
     source: entry.source,
     sha256: entry.sha256,
+    ...(entry.referencesSha256 ? { referencesSha256: entry.referencesSha256 } : {}),
     importedAt: entry.importedAt,
     ...(entry.license ? { license: entry.license } : {}),
     ...(entry.compatibility ? { compatibility: entry.compatibility } : {}),
@@ -303,6 +315,7 @@ export function installLibrarySkill(input: {
   name: string;
   description?: string;
   instructions: string;
+  references?: Array<{ path: string; content: string }>;
   source: string;
   license?: string;
   compatibility?: string;
@@ -320,13 +333,17 @@ export function installLibrarySkill(input: {
   const parsed = parseSkillMd(input.instructions);
   if ("error" in parsed) return parsed;
   if (parsed.name !== input.name) return { error: `the skill is named "${parsed.name}", not "${input.name}"` };
+  const references = input.references ?? [];
+  const referenceError = referenceLimitError(references);
+  if (referenceError) return { error: referenceError };
+  const referencesSha256 = skillReferencesSha256(references);
   const sha256 = sha256Hex(input.instructions);
   const indexRead = readSkillLibraryIndexState(root);
   if ("error" in indexRead) return indexRead;
   const index = indexRead.index;
   const existing = index[input.name];
   if (existing) {
-    if (existing.sha256 === sha256) return librarySkillListing(root, existing);
+    if (existing.sha256 === sha256 && existing.referencesSha256 === referencesSha256) return librarySkillListing(root, existing);
     return { error: `a skill named "${input.name}" is already in the library — choose a different name` };
   }
   const tags = input.tags?.length ? input.tags : parsed.tags;
@@ -335,6 +352,7 @@ export function installLibrarySkill(input: {
     description: input.description?.trim() || parsed.description,
     source: input.source,
     sha256,
+    ...(referencesSha256 ? { referencesSha256 } : {}),
     importedAt: new Date().toISOString(),
     reviewState: input.reviewState ?? "disabled",
     ...(input.license ? { license: input.license } : {}),
@@ -345,10 +363,10 @@ export function installLibrarySkill(input: {
     ...(input.package ? { package: { ...input.package } } : {}),
   };
   // Bytes first, index second: the index is the commit point, so a crash leaves unreferenced bytes, never a dangling entry.
-  mkdirSync(librarySkillDirectory(root, input.name), { recursive: true, mode: 0o700 });
-  writeFileAtomic(join(librarySkillDirectory(root, input.name), "SKILL.md"), input.instructions, { mode: 0o600 });
-  index[input.name] = entry;
-  writeSkillLibraryIndex(root, index);
+  writeLibraryFiles(librarySkillDirectory(root, input.name), input.instructions, references, () => {
+    index[input.name] = entry;
+    writeSkillLibraryIndex(root, index);
+  });
   skillLibraryEvents.emit("invalidate", { kind: "install", name: input.name });
   return librarySkillListing(root, entry);
 }
@@ -359,7 +377,7 @@ export function readLibrarySkillFile(name: string, root: string = skillsLibraryR
   if (!entry) return null;
   try {
     const text = readFileSync(join(librarySkillDirectory(root, name), "SKILL.md"), "utf8");
-    return sha256Hex(text) === entry.sha256 ? text : null;
+    return libraryContentMatches(root, entry) ? text : null;
   } catch {
     return null;
   }
@@ -391,7 +409,9 @@ export function setLibrarySkillReviewState(
 export function updateLibrarySkill(input: {
   name: string;
   instructions: string;
+  references?: Array<{ path: string; content: string }>;
   expectSha256: string;
+  expectReferencesSha256?: string | null;
   source?: string;
   root?: string;
 }): LibrarySkillListing | { stale: true } | { error: string } {
@@ -407,7 +427,12 @@ export function updateLibrarySkill(input: {
   if ("error" in indexRead) return indexRead;
   const index = indexRead.index;
   const entry = index[input.name];
-  if (!entry || entry.sha256 !== input.expectSha256 || !libraryContentMatches(root, entry)) return { stale: true };
+  if (!entry || entry.sha256 !== input.expectSha256 || (input.expectReferencesSha256 !== undefined && (entry.referencesSha256 ?? null) !== input.expectReferencesSha256) || !libraryContentMatches(root, entry)) return { stale: true };
+  const references = input.references ?? readLibrarySkillReferences(input.name, root);
+  if (!references) return { stale: true };
+  const referenceError = referenceLimitError(references);
+  if (referenceError) return { error: referenceError };
+  const referencesSha256 = skillReferencesSha256(references);
   const sha256 = sha256Hex(input.instructions);
   const now = Date.now();
   const descriptionHistory = parsed.description === entry.description
@@ -418,19 +443,22 @@ export function updateLibrarySkill(input: {
     ...entry,
     description: parsed.description,
     sha256,
+    ...(referencesSha256 ? { referencesSha256 } : {}),
     importedAt: new Date(now).toISOString(),
     ...(keptHistory?.length ? { descriptionHistory: keptHistory } : {}),
     ...(input.source ? { source: input.source } : {}),
     ...(parsed.tags?.length ? { tags: parsed.tags } : {}),
   };
+  if (!referencesSha256) delete next.referencesSha256;
   if (!parsed.tags?.length) delete next.tags;
   if (!keptHistory?.length) delete next.descriptionHistory;
   // Bytes, then index. A crash between the two leaves stored bytes the
   // index does not vouch for: the entry reads "changed after review" and
   // stays blocked until a person looks, never silently enabled.
-  writeFileAtomic(join(librarySkillDirectory(root, input.name), "SKILL.md"), input.instructions, { mode: 0o600 });
-  index[input.name] = next;
-  writeSkillLibraryIndex(root, index);
+  writeLibraryFiles(librarySkillDirectory(root, input.name), input.instructions, references, () => {
+    index[input.name] = next;
+    writeSkillLibraryIndex(root, index);
+  });
   skillLibraryEvents.emit("invalidate", { kind: "update", name: input.name });
   return librarySkillListing(root, next);
 }

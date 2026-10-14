@@ -17,7 +17,7 @@ import { DATA_DIR, type AppConfig } from "../config.ts";
 import { appendDecision } from "../decision-log.ts";
 import { UNDO_STALE, type DirectApply } from "../direct-apply.ts";
 import { redactSecretsInText } from "../redact.ts";
-import { readLibrarySkillFile, readSkillLibraryIndex, skillsLibraryEnabled } from "../skill-library.ts";
+import { readLibrarySkillFile, readSkillLibraryIndex, librarySkillRevision, skillsLibraryEnabled } from "../skill-library.ts";
 import {
   conversationAssignedSkills,
   prepareShareNote,
@@ -47,6 +47,7 @@ type ReceiptArgs = {
     source: string;
     files: Array<{ path: string; content: string }>;
     sha256: string;
+    referencesSha256?: string;
     warnings: string[];
   };
 };
@@ -132,7 +133,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
   function shareFromBot(
     botId: string,
     name: string,
-    receipt?: { threadId: string; messageId: string; expectSha256?: string },
+    receipt?: { threadId: string; messageId: string; expectSha256?: string; expectReferencesSha256?: string | null },
   ): SkillShareRecord | { error: string; stale?: true } {
     const bots = shareBotsNow();
     const author = bots.find((bot) => bot.id === botId);
@@ -140,7 +141,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
     const shared = shareLearnedSkill({
       author, bots, name, patchAssigned,
       audience: sourceAudience(author, receipt?.threadId),
-      ...(receipt?.expectSha256 ? { expectSha256: receipt.expectSha256 } : {}),
+      ...(receipt?.expectSha256 ? { expectSha256: receipt.expectSha256, expectReferencesSha256: receipt.expectReferencesSha256 ?? null } : {}),
     });
     // a receipt for a version that changed since keeps its card as it was
     if (receipt && !("stale" in shared)) {
@@ -162,7 +163,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
   function applySharedUpdate(
     from: BotRecord,
     threadId: string,
-    change: { name: string; skillMd: string; gist?: string; expectSha256: string | undefined },
+    change: { name: string; skillMd: string; references?: Array<{ path: string; content: string }>; gist?: string; expectSha256: string | undefined },
     direct: DirectApply,
   ): { name: string; summary: string; shared: string } | { error: string } {
     const bots = shareBotsNow();
@@ -176,6 +177,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
       bots,
       name: change.name,
       skillMd: change.skillMd,
+      references: change.references,
       expectSha256: change.expectSha256,
       patchAssigned,
       assignOnward: mode() === "auto",
@@ -187,7 +189,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
       botId: from.id,
       threadId,
       applied: true,
-      previous: { preview: updated.previous.skillMd, source: updated.previous.source },
+      previous: { preview: updated.previous.skillMd, source: updated.previous.source, references: updated.previous.references },
       shared: updated.share,
       staged: {
         id: randomUUID(),
@@ -195,7 +197,8 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
         name: change.name,
         gist,
         source: updated.previous.source,
-        files: [{ path: "SKILL.md", content: updated.content }],
+        files: [{ path: "SKILL.md", content: updated.content }, ...updated.references],
+        referencesSha256: updated.referencesSha256,
         sha256: updated.sha256,
         warnings: updated.warnings,
       },
@@ -275,11 +278,11 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
 
     /** skill_manage's update of a shared skill (`editable`): the response's
      * status and body. */
-    harnessUpdate(from: BotRecord, threadId: string, name: string, skillMd: string, gist: unknown, baseRevision: unknown, direct: DirectApply | null):
+    harnessUpdate(from: BotRecord, threadId: string, name: string, skillMd: string, gist: unknown, baseRevision: unknown, direct: DirectApply | null, references: Array<{ path: string; content: string }> = []):
       [status: number, body: Record<string, unknown>] {
       if (!direct) return [422, { state: "failed", error: "this conversation cannot update a shared team skill" }];
       const updated = applySharedUpdate(from, threadId, {
-        name, skillMd, gist: typeof gist === "string" ? gist : undefined, expectSha256: typeof baseRevision === "string" ? baseRevision : undefined,
+        name, skillMd, references, gist: typeof gist === "string" ? gist : undefined, expectSha256: typeof baseRevision === "string" ? baseRevision : undefined,
       }, direct);
       if ("error" in updated) return [422, { state: "failed", error: updated.error }];
       return [201, { state: "applied", name: updated.name, action: "update", summary: updated.summary, shared: updated.shared }];
@@ -290,7 +293,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
     harnessListing(botId: string, skills: SkillListing[]): Array<SkillListing & { revision?: string }> {
       if (mode() === "off") return skills;
       return skills.map((skill) => !skill.editable && editable(botId, skill.name)
-        ? { ...skill, editable: true, revision: skill.sha256.slice(0, SHARED_REVISION_CHARS) }
+        ? { ...skill, editable: true, revision: librarySkillRevision(readSkillLibraryIndex()[skill.name]).slice(0, SHARED_REVISION_CHARS) }
         : skill);
     },
 
@@ -323,7 +326,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
       if (request.shared) return { ok: true, shared: request.shared };
       const botId = message.from?.botId ?? store.botByThread(threadId)?.id;
       if (!botId || botId !== request.botId) return { ok: false, status: 403, error: "this skill belongs to a different bot" };
-      const shared = shareFromBot(botId, request.name, { threadId, messageId: message.id, expectSha256: request.sha256 });
+      const shared = shareFromBot(botId, request.name, { threadId, messageId: message.id, expectSha256: request.sha256, expectReferencesSha256: request.referencesSha256 ?? null });
       if ("stale" in shared) return { ok: false, status: 409, error: shared.error };
       return "error" in shared ? { ok: false, status: 422, error: shared.error } : { ok: true, shared };
     },
@@ -338,7 +341,7 @@ export function createSkillsLibraryHost(deps: SkillsLibraryHostDeps) {
         name: request.name,
         action: request.action,
         share: request.shared,
-        ...(request.previous ? { previous: { skillMd: request.previous.preview, source: request.previous.source } } : {}),
+        ...(request.previous ? { previous: { skillMd: request.previous.preview, source: request.previous.source, references: request.previous.references } } : {}),
         bots: shareBotsNow(),
         patchAssigned,
       });
@@ -363,4 +366,27 @@ function commitNote(commit: () => void): void {
   } catch (error) {
     console.warn(`[skills-library] could not record the shared-skill note: ${errorText(error)}`);
   }
+}
+
+export function skillCardCopy(staged: {
+  action: "create" | "update";
+  name: string;
+  gist: string;
+  warnings: string[];
+  files?: Array<{ path: string }>;
+}): {
+  title: string;
+  subtitle: string;
+  tool: string;
+} {
+  const warnings = staged.warnings.length ? `\n\nWarnings:\n- ${staged.warnings.join("\n- ")}` : "";
+  const references = (staged.files ?? []).filter((file) => file.path !== "SKILL.md").length;
+  const referenceNote = references ? ` It keeps ${references} reference file${references === 1 ? "" : "s"} the bot reads when needed.` : "";
+  return {
+    title: staged.action === "create"
+      ? `Enable skill "${staged.name}"?`
+      : `Update skill "${staged.name}"?`,
+    subtitle: `${staged.gist || staged.name}\n\nAdds one line to the prompt index; the body is read only when used.${referenceNote}${warnings}`,
+    tool: "stage_skill",
+  };
 }
