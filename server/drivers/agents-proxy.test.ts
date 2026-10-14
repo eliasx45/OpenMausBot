@@ -1968,6 +1968,17 @@ describe("agents-proxy MCP surface", () => {
       source: "conversation",
     });
     expect(lastSkillStageBody).toMatchObject({ action: "update", skill_name: "team-cut", base_revision: "0123456789ab" });
+    expect(manage.inputSchema.properties.references.items.required).toEqual(["path", "content"]);
+    await callTool("skill_manage", {
+      action: "update",
+      skill_name: "file-expense",
+      skill_md: "---\nname: file-expense\ndescription: Files expenses.\n---\n\nFor edge cases, read references/edge-cases.md.\n",
+      references: [{ path: "references/edge-cases.md", content: "# Edge cases\n" }],
+      source: "conversation",
+    });
+    expect(lastSkillStageBody).toMatchObject({
+      references: [{ path: "references/edge-cases.md", content: "# Edge cases\n" }],
+    });
 
     lastSkillStageBody = null;
     const missingTarget = await callTool("skill_manage", {

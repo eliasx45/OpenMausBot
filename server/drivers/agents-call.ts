@@ -1091,6 +1091,7 @@ export async function callTool(name: string, args: Json, context: ToolCallContex
         action: args.action,
         skill_name: skillName || undefined,
         skill_md: skillMd,
+        ...(Array.isArray(args.references) ? { references: args.references } : {}),
         gist: typeof args.gist === "string" ? args.gist : undefined,
         base_revision: typeof args.base_revision === "string" ? args.base_revision : undefined,
         source,
