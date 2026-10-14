@@ -52,7 +52,7 @@ export function createTeamContextRoutes(deps: TeamContextRouteDeps): RouteHandle
         );
         // the person's own entry never waits on the person
         if (proposed.status === "proposed") teamMemory.resolve(section, proposed.entry.id, "accept");
-        return json(res, 201, { entries: teamMemory.list(section) });
+        return json(res, 201, { entries: teamMemory.list(section), loadedIds: teamMemory.promptSelection(section).loadedIds });
       } catch (error) {
         return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
