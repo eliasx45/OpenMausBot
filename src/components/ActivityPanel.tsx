@@ -54,9 +54,10 @@ export function ActivityPanel({ bot }: { bot: Bot }) {
     return () => loadAbort.current?.abort();
   }, [load]);
 
+  const taskThreads = (bot.tasks ?? []).map((task) => task.threadId).sort().join("\0");
   const threadIds = useMemo(
-    () => new Set([bot.threadId, ...(bot.tasks ?? []).map((task) => task.threadId)]),
-    [bot.threadId, bot.tasks],
+    () => new Set([bot.threadId, ...taskThreads.split("\0").filter(Boolean)]),
+    [bot.threadId, taskThreads],
   );
   useEffect(() => {
     let settle: ReturnType<typeof setTimeout> | null = null;
