@@ -145,6 +145,8 @@ import { buildRecall } from "./recall.ts";
 import { hostTimeZone, takesTurnClock, turnClockLine, withTurnClock } from "./turn-clock.ts";
 import { createMemoryUpkeep, upkeepEnabled } from "./memory-upkeep.ts";
 import type { CaptureTurn } from "./memory-capture.ts";
+import { memoryTurn } from "./memory-turn.ts";
+import { evidenceInputSchema, recordProjectEvidence, verifyProjectEvidence, openEvidenceArtifact } from "./project-evidence.ts";
 import { appendAboutMe, commitLearned, planLearned } from "./profile-learned.ts";
 import { canAccessTeam, canReachPeer, coordinatorSupervises, livePeerRoster, livePeerRosterBlock, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, resolveTeammate, roomPeerRosterSystemPrompt, roomRosterLine, PEER_ACCESS_HELP } from "./peer-roster.ts";
 import {
@@ -402,7 +404,7 @@ import {
 import {
   readSectionContext,
   readSections,
-  sectionContextKey,
+  sectionContextKey, sectionMemoryKey,
   sectionContextLabel,
   sectionContextSystemPrompt,
   writeSectionContext,
@@ -508,7 +510,7 @@ import { fetchGithubTeam, fetchLibraryTeam, fetchTeamCatalog } from "./team-libr
 import { BOT_PACKAGE_MAX_SKILLS, isBotPackage, packageSummary, parsePackageDocument, renderBotPackageMarkdown, type PackageDocument } from "./bot-package.ts";
 import { createTeamManifest, parseTeamManifest } from "./team-manifest.ts";
 import { readThreadEvents } from "./thread-events.ts";
-import { TeamMemory, TEAM_MEMORY_KINDS, type TeamMemoryKind } from "./team-memory.ts";
+import { TeamMemory, TeamMemoryConflict, TEAM_MEMORY_KINDS, type TeamMemoryKind } from "./team-memory.ts";
 import { describeTool, readBotActivity } from "./activity.ts";
 import { OutboundCounts } from "./outbound-counts.ts";
 import { OutboundRequestService } from "./outbound-requests.ts";
@@ -6730,14 +6732,26 @@ const memoryUpkeep = createMemoryUpkeep({
     broadcast({ kind: "config", ...configStatus() });
     return facts.length;
   },
-  sourceLabel: (botId, threadId) => memorySourceLabel({ task: store.taskByThread(botId, threadId), threadId }),
+  sourceLabel: (botId, threadId) => memorySourceLabel({ room: store.groupByThread(threadId), task: store.taskByThread(botId, threadId), threadId }),
+  mayCapture: mayCaptureMemory,
+  proposeShared: (batch, candidate, turn) => {
+    const bot = store.bot(batch.botId);
+    if (!bot || !mayCaptureMemory(bot.id, batch.threadId) || !sameAudience(bot.visibility, undefined)) return;
+    const kind = candidate.kind === "lesson" ? "lesson" : candidate.kind === "question" ? "question" : candidate.kind === "outcome" ? "outcome" : "decision";
+    if (teamMemory.list(bot.section, true).some(entry => entry.detail === candidate.text && entry.kind === kind)) return;
+    const sourceLine = turn.room?.find(line => candidate.sourceQuote && line.text.replace(/\s+/g, " ").includes(candidate.sourceQuote.replace(/\s+/g, " ")));
+    const result = teamMemory.propose(bot.section, { kind, name: candidate.teamName!, detail: candidate.text, key: candidate.key },
+      { botId: bot.id, botName: bot.name, threadId: batch.threadId, at: Date.now(), messageId: sourceLine?.messageId ?? turn.sourceMessageId, turnId: turn.turnId, quote: candidate.sourceQuote });
+    store.appendMessage(batch.threadId, { role: "bot", kind: "options", from: { botId: bot.id, name: bot.name, color: bot.color },
+      card: { title: "Remember this for the team?", subtitle: `${result.entry.name} — ${result.entry.detail}`, options: ["Remember", "Skip"], requestId: result.entry.id,
+        tool: "propose_team_memory", teamMemoryRequest: { section: bot.section ?? "", entryId: result.entry.id, kind } } });
+  },
   // Turns still waiting at the last shutdown, read back from the transcript.
   // The checks that need only stored state run again; the in-memory ones
   // (internal, unattended) already passed before the turn was queued.
   restoreTurn: (botId, threadId, turnId) => {
-    if (store.botByThread(threadId)?.id !== botId || store.groupByThread(threadId) || routines?.runForThread(threadId)) return null;
-    if (CLOUD_HOME && !cloudOwnerOnlyThread(threadId)) return null;
-    return captureTurnFor(threadId, turnId);
+    if (!mayCaptureMemory(botId, threadId)) return null;
+    return captureTurnFor(threadId, turnId, botId);
   },
   // On a Cloud home upkeep only works on the owner's conversations (see the
   // capture hook below), so its writes are the owner's (lending-memory.ts).
@@ -6769,35 +6783,35 @@ bus.subscribe((event: RuntimeEvent) => {
 /** One finished turn as capture reads it: the person's message and the bot's
  * reply, or null when the reply is not on the active path (rewound) or the
  * message was another bot's ask. */
-function captureTurnFor(threadId: string, turnId: string): CaptureTurn | null {
-  const path = store.activePath(threadId);
-  const replyAt = path.findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.turnId === turnId);
-  if (replyAt < 0) return null;
-  const asked = path.slice(0, replyAt).findLast((message) => message.role === "user" && message.kind === "text");
-  if (!asked || asked.peerAsk) return null;
-  return {
-    person: extractTurnImages(asked.text ?? "").text,
-    bot: path[replyAt]!.text ?? "",
-    owner: !asked.sender,
-    turnId,
-  };
+function captureTurnFor(threadId: string, turnId: string, botId?: string, failed = false): CaptureTurn | null {
+  const bot = botId ? store.bot(botId) : store.botByThread(threadId);
+  return bot ? memoryTurn(store.activePath(threadId), bot.id, turnId, Boolean(store.groupByThread(threadId)), failed) : null;
 }
 
-// A finished 1:1 turn of an upkeep bot waits for capture. Only the person's
-// own conversation: not a room, not a turn another bot or the harness
-// started (its "user" line is not the person), not a failed turn.
+function mayCaptureMemory(botId: string, threadId: string): boolean {
+  const bot = store.bot(botId);
+  if (!bot || !upkeepEnabled(bot) || routines?.runForThread(threadId)) return false;
+  const room = store.groupByThread(threadId);
+  if (CLOUD_HOME) return !room && cloudOwnerOnlyThread(threadId);
+  return room ? !room.dm && sectionContextKey(room.section) === sectionContextKey(bot.section) && room.memberIds.includes(bot.id) && sameAudience(bot.visibility, undefined) && roomFeedsBot(room, bot)
+    : store.botByThread(threadId)?.id === botId;
+}
+
+// Finished personal turns feed private memory. Eligible room/delegated turns
+// stage shared proposals; failed turns may contribute lessons, never completion.
 bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
-  if (event.type !== "turn.completed" || !event.turnId || !event.ok) return;
+  if (event.type !== "turn.completed" || !event.turnId) return;
   try {
-    const bot = store.botByThread(event.threadId);
-    if (!bot || !upkeepEnabled(bot) || store.groupByThread(event.threadId) || isInternalTurn(event.threadId)
+    const reply = store.activePath(event.threadId).findLast(message => message.kind === "text" && message.role === "bot" && message.turnId === event.turnId);
+    const bot = store.botByThread(event.threadId) ?? (reply?.from ? store.bot(reply.from.botId) : undefined);
+    if (!bot || !mayCaptureMemory(bot.id, event.threadId)
       || isUnattended(bot.id, event.threadId) || routines?.runForThread(event.threadId)) return;
     // On a Cloud home the bot's memory reaches its owner's turns (and a lent
     // Mac): nothing is captured from a conversation anyone else wrote in.
     if (CLOUD_HOME && !cloudOwnerOnlyThread(event.threadId)) return;
-    const turn = captureTurnFor(event.threadId, event.turnId);
-    if (turn) memoryUpkeep.noteTurn(bot.id, event.threadId, turn);
+    const turn = captureTurnFor(event.threadId, event.turnId, bot.id, !event.ok);
+    if (turn && (!isInternalTurn(event.threadId) || turn.delegated)) memoryUpkeep.noteTurn(bot.id, event.threadId, turn);
   } catch (error) {
     console.warn(`memory upkeep: could not queue a turn for capture: ${(error as Error).message}`);
   }
@@ -12226,7 +12240,13 @@ function resolveAndSendTrust(res: ServerResponse, threadId: string, requestId: s
   if (teamMemoryCard?.card?.teamMemoryRequest) {
     const request = teamMemoryCard.card.teamMemoryRequest;
     const proposer = teamMemoryCard.from?.botId ? store.bot(teamMemoryCard.from.botId) : store.botByThread(threadId);
-    const result = teamMemory.resolve(request.section, request.entryId, behavior === "allow" ? "accept" : "reject");
+    let result;
+    try { result = teamMemory.resolveProposal(request.entryId, behavior === "allow" ? "accept" : "reject"); }
+    catch (error) {
+      if (!(error instanceof TeamMemoryConflict)) throw error;
+      json(res, 409, { error: error.message });
+      return true;
+    }
     if (!result.claimed) {
       if (!teamMemoryCard.card.answered) {
         store.patchMessage(threadId, teamMemoryCard.id, { card: { ...teamMemoryCard.card, answered: "unavailable", dismissed: true } });
@@ -17735,6 +17755,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           fromBotId: z.string().min(1).max(128),
           fromThreadId: z.string().min(1).max(128),
           kind: z.string(),
+          key: z.string().max(240).optional(),
+          evidence: evidenceInputSchema.optional(),
           name: z.string(),
           detail: z.string(),
           aliases: z.array(z.string()).optional(),
@@ -17753,10 +17775,18 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         let proposed: ReturnType<TeamMemory["propose"]>;
         try {
+          const folder = owner.group?.cwd ?? store.taskByThread(from.id, body.fromThreadId)?.cwd ?? from.cwd;
+          if (body.evidence && (!folder || body.kind !== "outcome")) return json(res, 400, { error: "Project evidence requires an outcome and a conversation working folder" });
+          const teamKey = sectionMemoryKey(from.section);
+          const evidence = body.evidence ? await recordProjectEvidence(folder!, body.evidence) : undefined;
+          requireActiveInternalCapability();
+          if (sectionMemoryKey(from.section) !== teamKey || !sameAudience(from.visibility, undefined) || (owner.group && !roomFeedsBot(owner.group, from))) return json(res, 409, { error: "Team or audience changed while recording evidence; retry in the current conversation" });
+          const currentFolder = owner.group?.cwd ?? store.taskByThread(from.id, body.fromThreadId)?.cwd ?? from.cwd;
+          if (body.evidence && currentFolder !== folder) return json(res, 409, { error: "Working folder changed while recording evidence; retry" });
           proposed = teamMemory.propose(
             from.section,
-            { kind: body.kind as TeamMemoryKind, name: body.name, detail: body.detail, aliases: body.aliases },
-            { botId: from.id, botName: from.name, threadId: body.fromThreadId, at: Date.now() },
+            { key: body.key, kind: body.kind as TeamMemoryKind, name: body.name, detail: body.detail, aliases: body.aliases },
+            { botId: from.id, botName: from.name, threadId: body.fromThreadId, at: Date.now(), turnId: liveTurnByThread.get(body.fromThreadId) }, evidence,
           );
         } catch (error) {
           return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -17931,9 +17961,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // the caller's own bot, never another's. A recall by time alone
         // has no words to match a file with.
         const scope = url.searchParams.get("scope") ?? "all";
-        if (scope !== "all" && scope !== "conversations" && scope !== "memory") {
-          return json(res, 400, { error: "scope must be all, conversations, or memory" });
+        if (scope !== "all" && scope !== "conversations" && scope !== "memory" && scope !== "team") {
+          return json(res, 400, { error: "scope must be all, conversations, memory, or team" });
         }
+        const teamHits = scope === "conversations" || scope === "memory" ? [] : teamMemory.search(from.section, q, limit, range);
+        if (scope === "team") return json(res, 200, { hits: [], memoryHits: [], teamHits });
         const memoryHits = scope === "conversations" || !q || from.memoryEnabled === false ? [] : searchMemoryFiles(from.id, q, limit);
         if (scope === "memory") return json(res, 200, { hits: [], memoryHits });
         // Own threads: the bot's main chat and tasks, and the rooms it is a
@@ -17971,7 +18003,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (inRoom) {
           discloseRecall(from, fromThreadId, hits.filter((hit) => hit.crossed).map((hit) => hit.threadId));
         }
-        return json(res, 200, { hits, memoryHits });
+        return json(res, 200, { hits, memoryHits, teamHits });
       }
       // session_read: the whole message behind a session_search hit. Same
       // own-bot scope — a message id from another bot's thread reads as
@@ -22427,18 +22459,21 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (path === "/api/team-memory" && (method === "GET" || method === "POST")) {
       if (!url.searchParams.has("section")) return json(res, 400, { error: "section is required" });
       const section = sectionContextKey(url.searchParams.get("section") ?? "");
+      if (section && !store.sections.includes(section)) return json(res, 404, { error: "No such team" });
       if (section.length > 60) return json(res, 400, { error: "section must be at most 60 characters" });
       if (method === "GET") {
-        return json(res, 200, { section, label: sectionContextLabel(section), entries: teamMemory.list(section) });
+        return json(res, 200, { section, label: sectionContextLabel(section), entries: teamMemory.list(section), loadedIds: teamMemory.promptSelection(section).loadedIds });
       }
       const body = await readBody(req);
       if (!body || typeof body !== "object" || !(TEAM_MEMORY_KINDS as readonly string[]).includes(String(body.kind))) {
         return json(res, 400, { error: `kind must be one of ${TEAM_MEMORY_KINDS.join(", ")}` });
       }
       try {
+        const input = TeamMemory.normalize({ kind: body.kind as TeamMemoryKind, name: String(body.name ?? ""), detail: String(body.detail ?? ""), aliases: Array.isArray(body.aliases) ? body.aliases.map(String) : undefined, key: typeof body.key === "string" ? body.key : undefined });
+        if (teamMemory.list(section).some(entry => entry.status === "accepted" && entry.key === input.key)) return json(res, 409, { error: "This fact already exists. Edit its current revision instead of adding a replacement." });
         const proposed = teamMemory.propose(
           section,
-          { kind: body.kind as TeamMemoryKind, name: String(body.name ?? ""), detail: String(body.detail ?? ""), aliases: Array.isArray(body.aliases) ? body.aliases.map(String) : undefined },
+          input,
           { botId: "", botName: "you", threadId: "", at: Date.now() },
         );
         // the person's own entry never waits on the person
@@ -22448,32 +22483,47 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
     }
+    m = path.match(/^\/api\/team-memory\/([\w-]+)\/evidence$/);
+    if (m && method === "GET") {
+      if (!url.searchParams.has("section")) return json(res, 400, { error: "section is required" });
+      const entry = teamMemory.list(url.searchParams.get("section")).find(candidate => candidate.id === m![1]);
+      const index = Number(url.searchParams.get("artifact"));
+      if (!entry?.evidence || !Number.isInteger(index) || index < 0) return json(res, 404, { error: "No such evidence" });
+      try {
+        const file = await openEvidenceArtifact(entry.evidence, index);
+        res.writeHead(200, { "content-type": "application/octet-stream", "content-length": file.bytes,
+          "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`, "cache-control": "no-store", "x-content-type-options": "nosniff" });
+        const stream = file.handle.createReadStream({ autoClose: true });
+        stream.on("error", () => res.destroy());
+        res.once("close", () => stream.destroy());
+        stream.pipe(res);
+        return;
+      } catch (error) { return json(res, 409, { error: error instanceof Error ? error.message : String(error) }); }
+    }
     m = path.match(/^\/api\/team-memory\/([\w-]+)$/);
     if (m && (method === "PATCH" || method === "DELETE")) {
       if (!url.searchParams.has("section")) return json(res, 400, { error: "section is required" });
       const section = sectionContextKey(url.searchParams.get("section") ?? "");
-      if (method === "DELETE") {
-        if (!teamMemory.remove(section, m[1])) return json(res, 404, { error: "no such entry" });
-        return json(res, 200, { entries: teamMemory.list(section) });
-      }
-      const body = await readBody(req);
-      if (!body || typeof body !== "object") return json(res, 400, { error: "body must be a JSON object" });
-      if (body.accept === true) {
-        const result = teamMemory.resolve(section, m[1], "accept");
-        if (!result.claimed) return json(res, 404, { error: "no such entry" });
-        return json(res, 200, { entries: teamMemory.list(section) });
-      }
-      const patch: { name?: string; detail?: string; aliases?: string[]; kind?: TeamMemoryKind } = {};
-      if (typeof body.name === "string") patch.name = body.name;
-      if (typeof body.detail === "string") patch.detail = body.detail;
-      if (Array.isArray(body.aliases)) patch.aliases = body.aliases.map(String);
-      if (typeof body.kind === "string" && (TEAM_MEMORY_KINDS as readonly string[]).includes(body.kind)) patch.kind = body.kind as TeamMemoryKind;
+      const body = method === "DELETE" ? { expectedRevision: url.searchParams.get("revision") } : await readBody(req);
+      if (!body || typeof body.expectedRevision !== "string" || !body.expectedRevision) return json(res, 428, { error: "Reload this memory and send its expectedRevision." });
       try {
-        const updated = teamMemory.update(section, m[1], patch);
-        if (!updated) return json(res, 404, { error: "no such entry" });
-        return json(res, 200, { entry: updated, entries: teamMemory.list(section) });
+        if (method === "DELETE") {
+          if (!teamMemory.remove(section, m[1], body.expectedRevision)) return json(res, 404, { error: "no such entry" });
+        } else if (body.approveEvidence === true) {
+          const entry = teamMemory.list(section).find(candidate => candidate.id === m![1]);
+          if (!entry?.evidence || !await verifyProjectEvidence(entry.evidence)) return json(res, 409, { error: "Evidence is missing or stale. Record the current revision first." });
+          if (!teamMemory.approveEvidence(section, m[1], body.expectedRevision, auth.kind === "session" ? auth.session.email ?? auth.session.label : "local owner")) return json(res, 404, { error: "No accepted outcome with evidence" });
+        } else if (body.accept === true) {
+          if (!teamMemory.resolve(section, m[1], "accept", body.expectedRevision).claimed) return json(res, 404, { error: "no such entry" });
+        } else {
+          const parsed = z.object({ name: z.string().optional(), detail: z.string().optional(), aliases: z.array(z.string()).optional(),
+            kind: z.enum(TEAM_MEMORY_KINDS).optional(), pinned: z.boolean().optional(), key: z.string().optional() }).safeParse(body);
+          if (!parsed.success) return json(res, 400, { error: "Invalid memory edit" });
+          if (!teamMemory.update(section, m[1], parsed.data, body.expectedRevision)) return json(res, 404, { error: "no such entry" });
+        }
+        return json(res, 200, { entries: teamMemory.list(section), loadedIds: teamMemory.promptSelection(section).loadedIds });
       } catch (error) {
-        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        return json(res, error instanceof TeamMemoryConflict ? 409 : 400, { error: error instanceof Error ? error.message : String(error) });
       }
     }
 

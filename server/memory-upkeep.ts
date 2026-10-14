@@ -2,7 +2,7 @@
 // unless switched off (BotRecord.memoryUpkeep === false). The main agent
 // keeps reading and writing its notes as before; this adds what happens
 // without it choosing:
-//   - capture: finished 1:1 turns are read after the chat goes quiet; core
+//   - capture: finished turns are read after the chat goes quiet; core
 //     facts go to MEMORY.md, detail to a topic file per subject that upkeep
 //     creates and names, with other words for it (server/memory-capture.ts);
 //     turns still waiting at shutdown are saved as ids and captured after
@@ -69,6 +69,8 @@ export interface UpkeepDeps {
   addToAboutMe: (from: { botId: string; botName: string }, texts: readonly string[]) => number;
   /** `chat "Title"`, for the source of a captured entry. */
   sourceLabel: (botId: string, threadId: string) => string;
+  mayCapture?: (botId: string, threadId: string) => boolean;
+  proposeShared?: (batch: CaptureBatch, candidate: Candidate, turn: CaptureTurn) => void;
   /** The turn as capture reads it, rebuilt from the transcript, or null when
    * it is gone (thread deleted, rewound) or no longer capturable. Without it
    * turns still waiting at shutdown are dropped, as before. */
@@ -142,7 +144,7 @@ function saveState(state: UpkeepState): void {
 // Turns still waiting at shutdown, kept as ids only: the transcript already
 // holds the text, and a thread deleted meanwhile leaves nothing behind.
 interface PendingCapture {
-  batches: { botId: string; threadId: string; turnIds: string[] }[];
+  batches: { botId: string; threadId: string; turnIds: string[]; failedIds?: string[] }[];
 }
 
 function pendingPath(): string {
@@ -150,17 +152,20 @@ function pendingPath(): string {
 }
 
 function savePending(batches: readonly CaptureBatch[]): void {
-  const byThread = new Map<string, { botId: string; threadId: string; turnIds: string[] }>();
+  const byThread = new Map<string, { botId: string; threadId: string; turnIds: string[]; failedIds: string[] }>();
   for (const batch of batches) {
     const ids = batch.turns.map((turn) => turn.turnId).filter((id): id is string => typeof id === "string" && id.length > 0);
     if (!ids.length) continue;
-    const entry = byThread.get(batch.threadId) ?? { botId: batch.botId, threadId: batch.threadId, turnIds: [] };
+    const key = `${batch.botId}\n${batch.threadId}`;
+    const entry = byThread.get(key) ?? { botId: batch.botId, threadId: batch.threadId, turnIds: [], failedIds: [] };
+    entry.failedIds.push(...batch.turns.filter(turn => turn.failed && turn.turnId).map(turn => turn.turnId!));
     entry.turnIds.push(...ids.filter((id) => !entry.turnIds.includes(id)));
-    byThread.set(batch.threadId, entry);
+    byThread.set(key, entry);
   }
   if (!byThread.size) return;
   const state: PendingCapture = {
-    batches: [...byThread.values()].slice(-MAX_PENDING_THREADS).map((entry) => ({ ...entry, turnIds: entry.turnIds.slice(-CAPTURE_MAX_TURNS) })),
+    batches: [...byThread.values()].slice(-MAX_PENDING_THREADS).map(({ failedIds, ...entry }) => ({ ...entry, turnIds: entry.turnIds.slice(-CAPTURE_MAX_TURNS),
+      ...(failedIds.length ? { failedIds: failedIds.filter(id => entry.turnIds.slice(-CAPTURE_MAX_TURNS).includes(id)) } : {}) })),
   };
   try {
     mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
@@ -186,7 +191,7 @@ function takePending(): PendingCapture["batches"] {
     return parsed.batches
       .filter((batch) => batch && typeof batch.botId === "string" && typeof batch.threadId === "string" && Array.isArray(batch.turnIds))
       .slice(-MAX_PENDING_THREADS)
-      .map((batch) => ({ botId: batch.botId, threadId: batch.threadId, turnIds: batch.turnIds.filter((id): id is string => typeof id === "string").slice(-CAPTURE_MAX_TURNS) }));
+      .map((batch) => ({ botId: batch.botId, threadId: batch.threadId, turnIds: batch.turnIds.filter((id): id is string => typeof id === "string").slice(-CAPTURE_MAX_TURNS), failedIds: Array.isArray(batch.failedIds) ? batch.failedIds.filter(id => typeof id === "string").slice(-CAPTURE_MAX_TURNS) : [] }));
   } catch {
     return [];
   }
@@ -270,7 +275,7 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     const bot = deps.bot(batch.botId);
     const at = now().getTime();
     const off: CaptureReport = { at, added: 0, topics: 0, aboutMe: 0, note: "upkeep is off" };
-    if (!upkeepEnabled(bot)) return off;
+    if (!upkeepEnabled(bot) || deps.mayCapture?.(batch.botId, batch.threadId) === false) return off;
     const engine = deps.engine(bot.id);
     if (!engine?.generateText) {
       const report = { at, added: 0, topics: 0, aboutMe: 0, note: NO_TEXT_ENGINE };
@@ -298,11 +303,28 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
     }
     // Re-read after the await: the bot or the person may have written since.
     // From here to the journal rows there is no await, so no write interleaves.
-    if (!upkeepEnabled(deps.bot(bot.id))) return off;
+    if (!upkeepEnabled(deps.bot(bot.id)) || deps.mayCapture?.(batch.botId, batch.threadId) === false) return off;
     const { parsed, added, topics } = writing(bot.id, () => {
       const before = readRaw(bot.id, "MEMORY.md");
       const archiveBefore = readRaw(bot.id, ARCHIVE_PATH);
-      const parsed = parseCandidates(answer, today);
+      const proposed = parseCandidates(answer, today);
+      const parsed: Candidate[] = [];
+      for (const candidate of proposed) {
+        const turn = candidate.sourceTurn === undefined ? undefined : batch.turns[candidate.sourceTurn];
+        const sourceText = turn ? [turn.person, turn.bot, ...(turn.room ?? []).map(line => line.text)].join("\n").replace(/\s+/g, " ") : "";
+        const grounded = Boolean(turn && candidate.sourceQuote && sourceText.includes(candidate.sourceQuote.replace(/\s+/g, " ")));
+        if (turn?.room || turn?.failed || turn?.delegated || (!turn && batch.turns.some(turn => turn.room || turn.failed || turn.delegated))) {
+          if (!grounded || !turn || (turn.failed && candidate.kind !== "lesson" && candidate.kind !== "question")) continue;
+          if (candidate.teamName && ["decision", "lesson", "question", "outcome"].includes(candidate.kind)) deps.proposeShared?.(batch, candidate, turn);
+          // Room knowledge belongs to the team's reviewed record, never About me.
+          continue;
+        }
+        if (candidate.kind === "outcome") {
+          if (!grounded) continue;
+          candidate.text = `Reported outcome (not independently verified): ${candidate.text}`;
+        }
+        parsed.push(candidate);
+      }
       const fresh = newCandidates(parsed, before ?? "");
       const source = `${deps.sourceLabel(bot.id, batch.threadId)} (noticed)`;
       let added = 0;
@@ -484,16 +506,31 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
       });
       recordMemoryChange(botId, { path: "MEMORY.md", actor: "upkeep", via: "tidy", before, after: readRaw(botId, "MEMORY.md") });
     }
-    // Topic files get the two steps that need no model: expired lines to the
-    // archive (written first, as above) and exact duplicates merged.
+    // Project topics also reconcile contradictory decisions; re-read after every model call.
     let topicExpired = 0;
     let topicDuplicates = 0;
+    let topicSuperseded = 0;
+    let topicDeferred = 0;
     for (const topic of listMemoryTopics(botId)) {
       if (topic.name === ARCHIVE_TOPIC) continue;
       const path = `memory/${topic.name}`;
       const topicBefore = readRaw(botId, path);
       if (topicBefore === null) continue;
-      const topicPlan = planTidy(topicBefore, today);
+      const topicCandidates = contradictionCandidates(topicBefore, today);
+      let topicContradictions: Contradiction[] = [];
+      if (engine?.generateText && topicCandidates.length >= 2) {
+        const answer = await askModel(engine, contradictionPrompt(topicCandidates));
+        if (paused || !upkeepEnabled(deps.bot(botId))) return stopped;
+        if (readRaw(botId, path) !== topicBefore) continue;
+        if (answer !== null) {
+          topicContradictions = parseContradictions(answer, topicCandidates.length);
+          contradictionsChecked = true;
+        }
+      }
+      // Project notes often contain only an old decision and its correction.
+      const topicPlan = planTidy(topicBefore, today, topicContradictions, 1);
+      topicSuperseded += topicPlan.superseded.length;
+      topicDeferred += topicPlan.deferred;
       if (!planChanges(topicPlan)) continue;
       const tidied = applyTidy(topicBefore, topicPlan, today);
       writing(botId, () => {
@@ -508,8 +545,8 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
       at,
       expired: plan.expired.length + topicExpired,
       duplicates: plan.duplicates.length + topicDuplicates,
-      superseded: plan.superseded.length,
-      deferred: plan.deferred,
+      superseded: plan.superseded.length + topicSuperseded,
+      deferred: plan.deferred + topicDeferred,
       ...(organized ? { organized } : {}),
       contradictionsChecked,
       ...(note ? { note } : {}),
@@ -571,7 +608,7 @@ export function createMemoryUpkeep(deps: UpkeepDeps): MemoryUpkeep {
             if (!upkeepEnabled(deps.bot(saved.botId))) continue;
             for (const turnId of saved.turnIds) {
               const turn = deps.restoreTurn(saved.botId, saved.threadId, turnId);
-              if (turn && (turn.person.trim() || turn.bot.trim())) buffer.add(saved.botId, saved.threadId, { ...turn, turnId });
+              if (turn && (turn.person.trim() || turn.bot.trim())) buffer.add(saved.botId, saved.threadId, { ...turn, turnId, failed: saved.failedIds?.includes(turnId) ?? turn.failed });
             }
           }
         } catch (error) {
