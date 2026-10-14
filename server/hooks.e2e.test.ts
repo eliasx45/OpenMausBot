@@ -167,17 +167,48 @@ posixOnly("engine hooks e2e: compaction", () => {
 posixOnly("engine hooks e2e: fix hints on failed tools", () => {
   const h = harness("hint", {}, {
     FAKE_CLAUDE_TOOL_CALLS: JSON.stringify([
-      { name: "Bash", input: { command: "ffmpeg -i in.mov out.mp4" }, ok: false, output: "Exit code 143\nCommand timed out after 2m 0s" },
+      { name: "Read", input: { file_path: "missing.txt" }, ok: false, output: "File does not exist." },
     ]),
   });
 
   it("answers a known PostToolUseFailure with a hint the engine sees, and leaves the failure a failure", async () => {
     const bot = await h.runTurn();
-    const row: Msg & { tool?: { ok?: boolean } } = bot.messages.find((m: Msg) => m.kind === "activity" && m.tool?.name === "Bash");
+    const row: Msg & { tool?: { ok?: boolean } } = bot.messages.find((m: Msg) => m.kind === "activity" && m.tool?.name === "Read");
     expect(row.tool!.ok).toBe(false);
     // the fake echoes the hook's additionalContext into its reply
     const reply: Msg = bot.messages.filter((m: Msg) => m.role === "bot" && m.kind === "text" && m.text).at(-1);
-    expect(reply.text).toContain("Hint: Run long jobs");
+    expect(reply.text).toContain("Hint: List the folder first");
+  });
+});
+
+posixOnly("engine hooks e2e: a shell call that hit its time limit", () => {
+  const dumpDir = mkdtempSync(join(tmpdir(), "omb-hooks-timeout-dump-"));
+  const dump = join(dumpDir, "turn.json");
+  afterAll(() => removeTempDir(dumpDir));
+  const h = harness("timeout", {}, {
+    FAKE_CLAUDE_DUMP: dump,
+    FAKE_CLAUDE_TOOL_CALLS: JSON.stringify([
+      { name: "Bash", input: { command: "ffmpeg -i talk.mp3 -ar 16000 talk.wav" }, ok: false, output: "Exit code 143\nCommand timed out after 2m 0s" },
+      { name: "Bash", input: { command: "find / -iname 'ggml-*.bin'" }, ok: false, output: "Exit code 143\nCommand timed out after 2m 0s" },
+      { name: "Bash", input: { command: "false" }, ok: false, output: "Exit code 1" },
+    ]),
+  });
+
+  it("tells the engine how to rerun it, and the prompt said so up front", async () => {
+    const bot = await h.runTurn();
+    // the fake echoes each failure hook's additionalContext into the reply:
+    // one hint per timed-out call, none for the ordinary failure
+    const reply: Msg = bot.messages.filter((m: Msg) => m.role === "bot" && m.kind === "text" && m.text).at(-1);
+    expect(reply.text!.match(/hit the shell time limit/g)).toHaveLength(2);
+    expect(reply.text).toContain("up to 600000");
+    expect(reply.text).toContain("mdfind -name");
+    const preview = await h.api("GET", `/api/bots/${bot.id}/system-prompt`);
+    const shell = preview.body.sections.find((s: { id: string }) => s.id === "shell");
+    expect(shell?.text).toContain("Long-running shell commands");
+    // the turn the engine actually ran: same section, and the cap it names
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.systemPrompt).toContain(shell.text.trim());
+    expect(seen.env.BASH_MAX_TIMEOUT_MS).toBe("600000");
   }, 60_000);
 });
 

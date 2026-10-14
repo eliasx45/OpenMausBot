@@ -396,7 +396,7 @@ import {
   composioSystemPrompt,
   customMcpPrompt,
   CREDENTIAL_PROMPT,
-  THREADS_PROMPT, WIDGET_PROMPT,
+  longCommandsPrompt, THREADS_PROMPT, WIDGET_PROMPT,
   LEARN_PROMPT,
   PROFILE_PROMPT,
   TEAM_MEMORY_PROMPT,
@@ -407,6 +407,7 @@ import {
   savedLoginsPrompt,
   teamAvailabilityPart,
 } from "./system-prompt.ts";
+import { shellTimeoutHint } from "./shell-timeout-hint.ts";
 import { readCuaConnection, readCuaUnavailableReason, gatedLocalComputer } from "./local-computer.ts";
 import {
   discoverExistingPerBotLocalVms,
@@ -3474,6 +3475,7 @@ function previewSystemPrompt(bot: BotRecord) {
           caps?.composioMcp === true && bot.composio !== false && composio.configured(cfg)),
       }),
     },
+    { id: "shell", label: "Long-running commands", text: privateWorkspace ? longCommandsPrompt(computerPromptKind) : "" },
     { id: "computer", label: "Computer", text: computerPrompt(computerPromptKind) },
     { id: "team-computer", label: "Team computer", text: teamComputerPrompt(teamComputer) },
     { id: "plan", label: "Surface", text: previewPlan.computer === undefined ? "" : surfacePrompt({
@@ -6269,16 +6271,13 @@ function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: 
     return { ok: true, context };
   }
   if (name === "Stop") return { ok: true };
-  // A failed native tool (Bash, Read, …): a known failure gets its fix hint
-  // beside the error (server/tool-hints.ts). The harness's own tools carry
-  // theirs in the result already, so the same hint is never added twice.
   if (name === "PostToolUseFailure") {
     const tool = typeof payload.tool_name === "string" ? payload.tool_name : "";
     const error = typeof payload.error === "string" ? payload.error : "";
     if (!tool || !error || payload.is_interrupt === true) return { ok: true, ignored: "failure without a tool error" };
-    const hint = fixHintFor({ tool, text: error });
-    if (!hint || error.includes(hint.hint)) return { ok: true };
-    return { ok: true, hookSpecificOutput: { hookEventName: "PostToolUseFailure", additionalContext: `${HINT_PREFIX}${hint.hint}` } };
+    const hint = shellTimeoutHint(tool, payload.tool_input, error) ?? fixHintFor({ tool, text: error })?.hint;
+    if (!hint || error.includes(hint)) return { ok: true };
+    return { ok: true, hookSpecificOutput: { hookEventName: "PostToolUseFailure", additionalContext: `${HINT_PREFIX}${hint}` } };
   }
   if (name !== "PostToolUse") return { ok: true, ignored: name || "unknown" };
   const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : "";
@@ -9436,6 +9435,7 @@ async function startTurn(
           connectedApps: setupConnectedApps(bot, instance.adapter.capabilities.composioMcp === true, Boolean(integrations.composio)),
         }) },
         { id: "files", label: "File locations", text: worksInWorkspace ? workspaceLocationsPrompt(bot.id, cwd, liveBot?.cwd ?? bot.cwd, { attachFile: Boolean(integrations.agents) && !CLOUD_HOME && !HOSTED_WORKSPACE }) : "" },
+        { id: "shell", label: "Long-running commands", text: worksInWorkspace ? longCommandsPrompt(computerPromptKind) : "" },
         { id: "computer", label: "Computer", text: computerPrompt(computerPromptKind) },
         { id: "team-computer", label: "Team computer", text: teamComputerPrompt(teamComputer) },
         { id: "plan", label: "Surface", text: surfacePrompt({ computer: mountedComputer, browser: Boolean(integrations.browser) }, { pinned: plan.pinned, note: plan.note + vpsUnavailableNote + (computerSkipped && plan.computer !== "off" ? computerSkippedNote(redactSecretsInText(computerSkipped)) : ""), canSelect: computerSelectionTurns.has(threadId), cloudHome: Boolean(CLOUD_HOME) }) },
@@ -11486,6 +11486,7 @@ async function runClaimedGroupMemberTurn(
   const roomSystem = buildSystemPrompt(system, store.bot(bot.id)?.soul ?? bot.soul ?? "", [
     { id: "user-profile", label: "About the user", text: userProfileSystemPrompt(cfg.profile) },
     { id: "files", label: "File locations", text: workspace ? workspaceLocationsPrompt(bot.id, cwd, readyBot.cwd, { attachFile: Boolean(integrations.agents) && !CLOUD_HOME && !HOSTED_WORKSPACE }) : "" },
+    { id: "shell", label: "Long-running commands", text: workspace ? longCommandsPrompt(roomComputerPromptKind) : "" },
     { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {})) },
     { id: "computer", label: "Computer", text: computerPrompt(roomComputerPromptKind) },
     { id: "team-computer", label: "Team computer", text: teamComputerPrompt(roomTeamComputer) },

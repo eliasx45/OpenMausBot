@@ -687,19 +687,26 @@ const playTurn = (prompt: JsonValue, late = false) => {
   const cacheRead = Number(process.env.FAKE_CLAUDE_CACHE_READ_TOKENS);
   const usage = { input_tokens: 10, cache_read_input_tokens: Number.isSafeInteger(cacheRead) && cacheRead > 0 ? cacheRead : 2, output_tokens: 5 };
   if (scriptedToolCalls) {
+    // scripted calls come first, each settled before the reply text
+    const failureContext: string[] = [];
     for (const call of scriptedToolCalls) {
       const id = call.id ?? `tu-${process.pid}-${++toolUseCount}`;
       out({ type: "assistant", message: { content: [{ type: "tool_use", id, name: call.name, input: call.input }], usage } });
       out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !call.ok, content: call.output }] } });
-      runHooks("PostToolUse", { tool_name: call.name, tool_input: call.input, tool_response: call.output, tool_use_id: id });
       if (!call.ok) {
-        // the real CLI reads additionalContext from a failure hook's
-        // hookSpecificOutput; the fake echoes it into the reply instead
-        const printed = runHooks("PostToolUseFailure", { tool_name: call.name, tool_input: call.input, tool_use_id: id, error: typeof call.output === "string" ? call.output : JSON.stringify(call.output), is_interrupt: false });
-        const context = printed.trim() ? (() => { try { return JSON.parse(printed).hookSpecificOutput?.additionalContext; } catch { return undefined; } })() : undefined;
-        if (typeof context === "string" && context) replyParts = [`${context}\n\n${replyParts[0] ?? ""}`, ...replyParts.slice(1)];
+        // the real CLI (2.1.296) sends a failed call to PostToolUseFailure
+        // only, with the result text as `error`, and hands the model any
+        // additionalContext the hook prints
+        const printed = runHooks("PostToolUseFailure", { tool_name: call.name, tool_input: call.input, error: call.output, tool_use_id: id });
+        try {
+          const context = JSON.parse(printed)?.hookSpecificOutput?.additionalContext;
+          if (typeof context === "string" && context) failureContext.push(context);
+        } catch {}
+      } else {
+        runHooks("PostToolUse", { tool_name: call.name, tool_input: call.input, tool_response: call.output, tool_use_id: id });
       }
     }
+    if (failureContext.length) replyParts = [`${failureContext.join("\n")}\n\n${replyParts[0] ?? ""}`, ...replyParts.slice(1)];
     for (const text of replyParts) out({ type: "assistant", message: { content: [{ type: "text", text }], usage } });
   } else {
     replyParts.forEach((text, index) => {

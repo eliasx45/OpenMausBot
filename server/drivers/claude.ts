@@ -557,6 +557,8 @@ export const STEERED_CONTINUATION_GRACE_MS = 2_000;
  * milliseconds) before the turn closes on the held result. */
 export const STEERED_CONTINUATION_SILENCE_MS = 30_000;
 
+export const CLAUDE_BASH_MAX_TIMEOUT_MS = 10 * 60_000;
+
 const fakeTimerScale = (name: string) => Number(process.env[name] ?? "1") || 1;
 const steerGraceScale = () => fakeTimerScale("FAKE_CLAUDE_STEER_GRACE_SCALE");
 const steerSilenceScale = () => fakeTimerScale("FAKE_CLAUDE_STEER_SILENCE_SCALE");
@@ -1368,6 +1370,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (authSettingsPath) args.push("--settings", authSettingsPath);
       // Approvals and browser credentials expire at the turn boundary; native background workers must not outlive it.
       env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+      // With no background shell, a long media job's way past the 2-minute
+      // default is a per-call `timeout`; the prompt promises up to this cap.
+      // A cap the person set themselves wins.
+      env.BASH_MAX_TIMEOUT_MS ||= String(CLAUDE_BASH_MAX_TIMEOUT_MS);
       const cwd = turn.cwd ?? homedir();
       const commandCwd = permissionLaunchCwd(cwd);
       const privateFileFlags = new Set(["--mcp-config", "--settings"]);
