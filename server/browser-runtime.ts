@@ -1,5 +1,8 @@
 import { killCliTree, spawnCli } from "./procs.ts";
-import { DEFAULT_BROWSER_RESULT_BUDGET, describePageChange, OBSERVE_PAGE_SCRIPT, parsePageState, shapeBrowserToolResult, slimBrowserToolList, stripHarnessOwnedArguments, type PageState } from "./browser-tool-shape.ts";
+import { scrubHeldSecrets } from "../shared/redact.ts";
+import { DEFAULT_BROWSER_RESULT_BUDGET, describePageChange, OBSERVE_PAGE_SCRIPT, parsePageState, scrubBrowserResult, shapeBrowserToolResult, slimBrowserToolList, stripHarnessOwnedArguments, type PageState } from "./browser-tool-shape.ts";
+import { BrowserLanes } from "./browser-lane.ts";
+import type { BrowserSteps, StepCall, StepContext } from "./browser-steps.ts";
 
 export interface BrowserSpawnSpec {
   command: string;
@@ -18,6 +21,12 @@ const BROWSER_RESTART_TOOL_SPEC = {
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
 };
 const BROWSER_INTERRUPTED = `The browser engine is stuck. Press Restart in the Browser panel, or call ${BROWSER_RESTART_TOOL}, before using browser tools again.`;
+/** Told on the first call after an idle close (closeIfIdle). A temporary
+ * browser saves nothing, so its sign-ins went with it. */
+const idleClosedNote = (saves: boolean) => `Your browser sat unused and was closed to free memory; this call opened it again. Pages you had open are gone (${saves ? "saved sign-ins are kept" : "it is a temporary browser, so its sign-ins are gone too"}), so open the page you need again before using earlier @eN refs.`;
+/** A call waited the lane's 30 s behind the same browser's previous one (the
+ * harness proxy gives one call 130 s, and a stuck action holds 120 s). */
+const LANE_BUSY = "Your previous browser call is still running; wait for it to finish, then call again.";
 const RESTART_COST = "a restart closes every tab and loses page state such as form input and sign-ins";
 /** Actions whose result also says what changed on the page, so the model
  * need not spend a step reading it back. */
@@ -52,14 +61,66 @@ export function browserRuntimeEnv(overrides: Record<string, string | undefined>)
 export const BROWSER_VIEWPORT = { width: 1280, height: 720 } as const;
 export const BROWSER_VIEWPORT_ARGS = ["set", "viewport", String(BROWSER_VIEWPORT.width), String(BROWSER_VIEWPORT.height)] as const;
 
+/** A session attached to a Chrome that is already running: the person's own
+ * (My Chrome), found automatically or at a configured address. */
+export function attachesToChrome(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.AGENT_BROWSER_CDP || env.AGENT_BROWSER_AUTO_CONNECT);
+}
+
 /** Only a headless browser this server launches is OMB's to size. A browser
  * attached over CDP is someone's own Chrome, and a headed window is the
  * user's to size. */
 export function ownsBrowserViewport(env: NodeJS.ProcessEnv): boolean {
-  return env.AGENT_BROWSER_HEADLESS === "1" && !env.AGENT_BROWSER_CDP;
+  return env.AGENT_BROWSER_HEADLESS === "1" && !attachesToChrome(env);
 }
 
 export class TransportError extends Error {}
+
+/** One timed browser action, logged with OMB_BROWSER_TIMING=1. Times are in
+ * milliseconds. `inFlight` counts this session's browser work already running
+ * when the action started: the engine runs one command per session, so the
+ * action waited behind it. */
+export interface BrowserTiming {
+  session: string;
+  tool: string;
+  outcome: "ok" | "error";
+  totalMs: number;
+  /** Transport handshake and page sizing; the first call launches the browser here. */
+  launchMs?: number;
+  engineMs?: number;
+  /** Page reads: the snapshot after agent_browser_open, or the text before and after a page action. */
+  observeMs?: number;
+  /** What the page reported, and a recorded step (browser-steps.ts). */
+  stepsMs?: number;
+  /** Text the model receives, after shaping; the frame's base64 for a preview frame. */
+  chars?: number;
+  inFlight: number;
+}
+
+export function formatBrowserTiming(timing: BrowserTiming): string {
+  const parts = [`browser timing: ${timing.tool} ${timing.outcome}`];
+  const phases: Array<[string, number | undefined]> = [
+    ["total", timing.totalMs], ["launch", timing.launchMs], ["engine", timing.engineMs], ["observe", timing.observeMs], ["steps", timing.stepsMs],
+  ];
+  for (const [label, value] of phases) {
+    if (value !== undefined) parts.push(`${label}=${Math.round(value)}ms`);
+  }
+  if (timing.chars !== undefined) parts.push(`chars=${timing.chars}`);
+  parts.push(`inflight=${timing.inFlight}`, `session=${timing.session}`);
+  return parts.join(" ");
+}
+
+/** The text a tool result hands the model, in characters. */
+function resultChars(result: unknown): number {
+  const content = (result as { content?: unknown } | null)?.content;
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const item of content) {
+    const text = (item as { text?: unknown } | null)?.text;
+    if (typeof text === "string") chars += text.length;
+  }
+  return chars;
+}
 
 /** An error the engine answered: the action ran and failed (a page that
  * would not load). Nothing is left running in the browser, so unlike a
@@ -245,6 +306,9 @@ interface Gate {
   ready: boolean;
   releasing: boolean;
   agents: number;
+  /** Agent actions whose command reached the engine. A refused call or a
+   * preview frame counts in `agents` but leaves the page as it was. */
+  dispatched: number;
   humans: number;
   uncertain: boolean;
   /** The agent call that lost its transport (a timeout, a crash), while it is
@@ -254,6 +318,19 @@ interface Gate {
   lostCall: string | null;
   closing: boolean;
   changed: Set<() => void>;
+  /** Live views open on this browser (watch): it is never idle while one is. */
+  watchers: number;
+  /** The bot's MCP requests in flight (agentRpc), a tool listing and a call
+   * waiting in the lane included. */
+  calls: number;
+  /** When a bot, a person or a live view last used it; never a preview frame. */
+  lastUsed: number;
+  /** Its launch settings, as last used: an idle close closes with them. */
+  spec?: BrowserSpawnSpec;
+  /** An idle close in progress: agent calls and new views wait for it. */
+  idleClose?: Promise<void>;
+  /** Closed while idle since the last agent call, which is told so. */
+  idleClosed: boolean;
 }
 
 /** A session's MCP client, the launch settings it was started with, and its
@@ -274,20 +351,45 @@ export class BrowserRuntime {
   /** recoveryCheckMs: how long the call after a lost one waits for the
    * engine to answer. It stays well inside the harness proxy's 130 s budget
    * for one call. */
-  private options: { requestTimeoutMs: number; takeoverTimeoutMs: number; idleMs: number; maxPending: number; resultBudget: number; recoveryCheckMs: number };
+  private options: { requestTimeoutMs: number; takeoverTimeoutMs: number; idleMs: number; maxPending: number; resultBudget: number; recoveryCheckMs: number; laneWaitMs: number };
   private closeBrowser: CloseBrowser;
   private applyViewport?: ApplyViewport;
+  /** Around each bot call: page health for every bot, recorded steps for some. */
+  private steps?: Pick<BrowserSteps, "before" | "after" | "signIn" | "note" | "forget" | "recentFrame" | "personTook">;
+  private lanes = new BrowserLanes();
+  /** Held secrets (a filled login's password, a fresh one-time code) out of
+   * every tool result before the bot reads it. */
+  private scrub: (text: string) => string;
+  private onTiming?: (timing: BrowserTiming) => void;
 
-  constructor({ closeBrowser, applyViewport, ...options }: Partial<BrowserRuntime["options"]> & { closeBrowser?: CloseBrowser; applyViewport?: ApplyViewport } = {}) {
-    this.options = { requestTimeoutMs: 120_000, takeoverTimeoutMs: 15_000, idleMs: 60_000, maxPending: 16, resultBudget: DEFAULT_BROWSER_RESULT_BUDGET, recoveryCheckMs: 30_000, ...options };
+  constructor({ closeBrowser, applyViewport, steps, scrub, onTiming, ...options }: Partial<BrowserRuntime["options"]> & { closeBrowser?: CloseBrowser; applyViewport?: ApplyViewport; steps?: BrowserRuntime["steps"]; scrub?: (text: string) => string; onTiming?: (timing: BrowserTiming) => void } = {}) {
+    this.options = { requestTimeoutMs: 120_000, takeoverTimeoutMs: 15_000, idleMs: 60_000, maxPending: 16, resultBudget: DEFAULT_BROWSER_RESULT_BUDGET, recoveryCheckMs: 30_000, laneWaitMs: 30_000, ...options };
     this.closeBrowser = closeBrowser ?? (async () => false);
     this.applyViewport = applyViewport;
+    this.steps = steps;
+    this.scrub = scrub ?? scrubHeldSecrets;
+    this.onTiming = onTiming;
+  }
+
+  private timed<T>(session: string, tool: string, phases: Partial<BrowserTiming>, fn: () => Promise<T>): Promise<T> {
+    if (!this.onTiming) return fn();
+    const onTiming = this.onTiming;
+    const started = performance.now();
+    const inFlight = this.gate(session).agents;
+    const report = (outcome: BrowserTiming["outcome"]) => onTiming({ session, tool, outcome, totalMs: performance.now() - started, ...phases, inFlight });
+    return fn().then((result) => {
+      report((result as { isError?: unknown } | null)?.isError === true ? "error" : "ok");
+      return result;
+    }, (error: unknown) => {
+      report("error");
+      throw error;
+    });
   }
 
   private gate(session: string): Gate {
     let gate = this.gates.get(session);
     if (!gate) {
-      gate = { owner: null, ready: false, releasing: false, agents: 0, humans: 0, uncertain: false, lostCall: null, closing: false, changed: new Set() };
+      gate = { owner: null, ready: false, releasing: false, agents: 0, dispatched: 0, humans: 0, uncertain: false, lostCall: null, closing: false, changed: new Set(), watchers: 0, calls: 0, lastUsed: Date.now(), idleClosed: false };
       this.gates.set(session, gate);
     }
     return gate;
@@ -303,6 +405,14 @@ export class BrowserRuntime {
   }
 
   async withAgentAction<T>(session: string, fn: () => Promise<T>): Promise<T> {
+    return this.agentAction(session, fn, true);
+  }
+
+  /** `use`: the bot's own action, after which the browser's idle time starts
+   * again. A preview frame only looks: it holds off an idle close while it
+   * runs (closeIfIdle sees `agents`), but frames beside a turn must not keep
+   * a browser nothing uses open. */
+  private async agentAction<T>(session: string, fn: () => Promise<T>, use: boolean): Promise<T> {
     const gate = this.gate(session);
     if (gate.owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
     if (gate.uncertain) throw new Error(BROWSER_INTERRUPTED);
@@ -315,8 +425,21 @@ export class BrowserRuntime {
       return result;
     } finally {
       gate.agents--;
+      if (use) gate.lastUsed = Date.now();
       this.changed(gate);
     }
+  }
+
+  /** fill_login's typing: a bot action in the browser's lane, so no capture
+   * or read runs while a secret is typed, then a step without a screenshot. */
+  async withSecretInput<T extends { ok: boolean; text: string; host?: string; filled?: string[] }>(session: string, spec: Pick<BrowserSpawnSpec, "command" | "env">, fn: () => Promise<T>, ctx?: StepContext): Promise<T> {
+    const outcome = await this.lanes.run(session, async () => {
+      const value = await this.withAgentAction(session, fn);
+      const step = await this.steps?.signIn({ session, spec, ctx }, value).catch(() => null);
+      return step ? { ...value, text: `${value.text} Recorded as step ${step}.` } : value;
+    }, this.options.laneWaitMs);
+    if (outcome === null) throw new Error(LANE_BUSY);
+    return outcome;
   }
 
   /** One live-preview frame, skipped while an agent action runs in this
@@ -324,13 +447,52 @@ export class BrowserRuntime {
    * time: a frame sent behind a stuck action stays queued there after its own
    * timeout. Measured on agent-browser 0.37.0, 27 such frames during a 120 s
    * stuck click kept the engine busy for about two minutes after the click
-   * ended, so neither recovery nor a restart could reach it. */
+   * ended, so neither recovery nor a restart could reach it. Right after a
+   * recorded step, the frame is that step's own screenshot. A frame is not
+   * use: the browser's idle time goes on (agentAction). */
   async previewFrame<T>(session: string, capture: () => Promise<T>): Promise<T> {
-    if (this.gate(session).agents > 0) throw new Error("The browser is busy with an agent action.");
-    return this.withAgentAction(session, capture);
+    if (this.gate(session).agents > 0 || this.lanes.held(session)) throw new Error("The browser is busy with an agent action.");
+    const phases: Partial<BrowserTiming> = {};
+    return this.timed(session, "preview_frame", phases, () => this.agentAction(session, async () => {
+      const frame = (this.steps?.recentFrame(session) as T | null | undefined) ?? await capture();
+      const png = (frame as { png?: unknown } | null)?.png;
+      if (typeof png === "string") phases.chars = png.length;
+      return frame;
+    }, false));
   }
 
-  async agentRpc(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void): Promise<unknown> {
+  /** One MCP request from the bot's turn. Every tool result it answers,
+   * the runtime's own recovery notes included, is scrubbed of held secrets
+   * on the way out. */
+  async agentRpc(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void, ctx?: StepContext): Promise<unknown> {
+    // A call that arrives while its idle browser closes waits, then reopens
+    // it. Without one, nothing is awaited: the call is counted in the same
+    // turn of the event loop, so no idle close can start under it, and it
+    // stays counted while it waits in the lane and while its page reads and
+    // recorded step run.
+    for (let closing = this.gates.get(session)?.idleClose; closing; closing = this.gates.get(session)?.idleClose) await closing;
+    const gate = this.gate(session);
+    gate.spec = spec;
+    gate.calls++;
+    let result: unknown;
+    try {
+      const request = () => this.agentRequest(session, spec, method, params, beforeDispatch, ctx);
+      // A listing, a restart, and calls that only wait for an interrupted
+      // browser to answer (one shared check) touch no page: they skip the lane.
+      result = method !== "tools/call" || toolNameOf(params) === BROWSER_RESTART_TOOL || gate.uncertain ? await request() : await this.lanes.run(session, request, this.options.laneWaitMs);
+    } finally { gate.calls--; gate.lastUsed = Date.now(); }
+    if (method !== "tools/call") return result;
+    // A call that gave up behind another ran nothing, so it reopened nothing:
+    // the bot hears about an idle close from the call that did.
+    if (result === null || result === undefined) return scrubBrowserResult({ isError: true, content: [{ type: "text", text: LANE_BUSY }] }, this.scrub);
+    if (!gate.idleClosed) return scrubBrowserResult(result, this.scrub);
+    gate.idleClosed = false;
+    const content = (result as { content?: unknown } | null)?.content;
+    const note = idleClosedNote(spec.env.AGENT_BROWSER_RESTORE_SAVE !== "never");
+    return scrubBrowserResult({ ...result as object, content: [{ type: "text", text: note }, ...Array.isArray(content) ? content : []] }, this.scrub);
+  }
+
+  private async agentRequest(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void, ctx?: StepContext): Promise<unknown> {
     if (method !== "tools/list" && method !== "tools/call") throw new Error("Unsupported browser method.");
     // tools/list bypasses withAgentAction (a human may hold control), so it
     // must refuse the closing window itself or its client outlives restart().
@@ -338,6 +500,7 @@ export class BrowserRuntime {
     if (method === "tools/call" && params && typeof params === "object" && (params as { name?: unknown }).name === BROWSER_RESTART_TOOL) {
       beforeDispatch?.();
       await this.agentRestart(session, () => this.closeBrowser(session, spec));
+      await this.steps?.note(ctx, { tool: BROWSER_RESTART_TOOL, ok: true });
       beforeDispatch?.(); // A turn revoked while the browser closed receives no result.
       return { content: [{ type: "text", text: "Browser restarted. Open pages were closed; open the page you need again and check whether the interrupted action already happened before repeating it." }] };
     }
@@ -360,7 +523,10 @@ export class BrowserRuntime {
       beforeDispatch?.(); // A turn revoked during the check receives no result.
       return url === null ? stillBusyToolError(lostCall) : recoveredResult(lostCall, url);
     }
+    const phases: Partial<BrowserTiming> = {};
     const invoke = async () => {
+      const launchStarted = performance.now();
+      let dispatched = false;
       const entry = this.connect(session, spec);
       await entry.client.ready;
       beforeDispatch?.();
@@ -374,14 +540,26 @@ export class BrowserRuntime {
         beforeDispatch?.();
         if (this.gate(session).owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
       }
+      phases.launchMs = performance.now() - launchStarted;
       try {
         // The model sees slimmed schemas and text-only, bounded results; the
         // launch/session parameters OMB owns never reach the engine from a call.
         const request = method === "tools/call" ? stripHarnessOwnedArguments(params) : params;
+        const args = (request as { arguments?: unknown } | null)?.arguments;
+        const call: StepCall | null = this.steps && method === "tools/call" && toolName !== undefined ? {
+          session, spec, tool: toolName, args: args && typeof args === "object" ? args as Record<string, unknown> : {}, ctx,
+          stopped: () => gate.owner !== null || gate.uncertain || gate.closing,
+          alive: () => { try { beforeDispatch?.(); return true; } catch { return false; } },
+          resize: async () => { if (this.applyViewport) await (entry.viewport = this.applyViewport(spec).catch(() => undefined)); },
+        } : null;
+        const stepsStarted = performance.now();
+        const stepState = call ? await this.steps!.before(call) : null;
+        phases.stepsMs = performance.now() - stepsStarted;
         // Read the page around an action with eval, not a snapshot: a
         // snapshot renumbers every @eN ref the model holds. A failed read only
         // leaves the change out; a lost transport still engages recovery.
         const observePage = async (): Promise<PageState | null> => {
+          const observeStarted = performance.now();
           try {
             return parsePageState(await entry.client.rpc("tools/call", {
               name: "agent_browser_eval", arguments: { script: OBSERVE_PAGE_SCRIPT, timeoutMs: 5_000 },
@@ -389,6 +567,8 @@ export class BrowserRuntime {
           } catch (error) {
             if (error instanceof TransportError) throw error;
             return null;
+          } finally {
+            phases.observeMs = (phases.observeMs ?? 0) + performance.now() - observeStarted;
           }
         };
         let before: PageState | null = null;
@@ -397,7 +577,10 @@ export class BrowserRuntime {
           beforeDispatch?.();
           if (this.gate(session).owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
         }
+        const engineStarted = performance.now();
+        if (method === "tools/call") { dispatched = true; gate.dispatched++; }
         let result = await entry.client.rpc(method, request);
+        phases.engineMs = performance.now() - engineStarted;
         beforeDispatch?.(); // A turn revoked while the tool ran receives no result.
         if (method === "tools/list") {
           const tools = withRestartTool(slimBrowserToolList(result));
@@ -421,6 +604,7 @@ export class BrowserRuntime {
           beforeDispatch?.();
           if (this.gate(session).owner !== null) throw new Error(BROWSER_CONTROL_REFUSAL);
           let observation: unknown;
+          const observeStarted = performance.now();
           try {
             observation = await entry.client.rpc("tools/call", {
               name: "agent_browser_snapshot", arguments: { compact: true },
@@ -430,9 +614,11 @@ export class BrowserRuntime {
             // Transport failures still engage the uncertainty/recovery gate.
             if (error instanceof TransportError) throw error;
             observation = { isError: true, content: [] };
+          } finally {
+            phases.observeMs = (phases.observeMs ?? 0) + performance.now() - observeStarted;
           }
           beforeDispatch?.();
-          const navigation = result as { content?: unknown[] };
+          const navigation = result as { content?: unknown[]; structuredContent?: unknown };
           const page = observation as { content?: unknown[]; isError?: boolean } | null;
           const observed = page?.isError !== true && Array.isArray(page?.content) && page.content.some((item) =>
             item && typeof item === "object" && (item as { type?: unknown }).type === "text" &&
@@ -445,10 +631,20 @@ export class BrowserRuntime {
                 : "Page observed after navigation. Its refs are current, so act on them without another snapshot. Check this result for redirects, sign-in requirements or page errors before reporting task success:" },
               ...(Array.isArray(page?.content) ? page.content : []),
             ],
+            // The engine's own answer (a launch it reports) for the steps hook; shaping drops it.
+            ...(navigation.structuredContent !== undefined ? { structuredContent: navigation.structuredContent } : {}),
             ...(!observed ? { isError: true } : {}),
           };
         }
-        return shapeBrowserToolResult(result, { toolName, budget: this.options.resultBudget });
+        const afterStarted = performance.now();
+        const extra = call && stepState ? await this.steps!.after(call, result, stepState, phases.engineMs) : null;
+        phases.stepsMs = (phases.stepsMs ?? 0) + performance.now() - afterStarted;
+        beforeDispatch?.();
+        // Appended after shaping, so a long snapshot never cuts them off.
+        const shaped = shapeBrowserToolResult(result, { toolName, budget: this.options.resultBudget }) as { content?: unknown[] };
+        const final = extra?.parts.length && Array.isArray(shaped?.content) ? { ...shaped, content: [...shaped.content, ...extra.parts] } : shaped;
+        phases.chars = resultChars(final);
+        return final;
       }
       catch (error) {
         // An MCP timeout cannot prove the independent daemon stopped an
@@ -463,10 +659,11 @@ export class BrowserRuntime {
         }
         throw error;
       }
+      finally { if (dispatched) gate.dispatched--; }
     };
     if (method !== "tools/call") return invoke();
     try {
-      return await this.withAgentAction(session, invoke);
+      return await this.timed(session, toolName ?? "unknown", phases, () => this.withAgentAction(session, invoke));
     } catch (error) {
       if (error instanceof Error && error.message === BROWSER_INTERRUPTED) return stuckBrowserToolError();
       // The call that lost its transport: a tool result that says what is
@@ -535,8 +732,9 @@ export class BrowserRuntime {
     }
   }
 
-  /** Resolves true when the grant had to wait for the bot's own browser
-   * action to finish: the page may have changed since the person aimed. */
+  /** Resolves true when the grant had to wait for a bot command the engine
+   * received: the page may have changed since the person aimed. A wait for a
+   * refused call or a preview frame is not one, so the person's input stands. */
   async take(session: string, owner: string): Promise<boolean> {
     if (!owner) throw new Error("Browser control requires an owner.");
     const gate = this.gate(session);
@@ -544,7 +742,8 @@ export class BrowserRuntime {
     if (gate.owner !== null && gate.owner !== owner) throw new Error("Another person controls this browser.");
     gate.owner = owner; // synchronous: no new agent work slips in while draining.
     gate.ready = false;
-    const waited = gate.agents > 0;
+    this.steps?.personTook(session); // what the page reports while they hold it is theirs
+    const waited = gate.dispatched > 0;
     await new Promise<void>((resolve, reject) => {
       const finish = (error?: Error) => {
         clearTimeout(timer);
@@ -591,6 +790,7 @@ export class BrowserRuntime {
     if (!owner || !gate || gate.owner !== owner) return;
     gate.ready = false;
     gate.releasing = true;
+    gate.lastUsed = Date.now();
     this.changed(gate); // don't admit agents until pending human input drains.
   }
 
@@ -610,7 +810,66 @@ export class BrowserRuntime {
       }
       throw error;
     }
-    finally { gate.humans--; this.changed(gate); }
+    finally { gate.humans--; gate.lastUsed = Date.now(); this.changed(gate); }
+  }
+
+  /** A live view opened on this browser: it stays open while watched, and
+   * its idle time starts when the last view leaves. Call the returned
+   * function once the view closes. */
+  watch(session: string, spec: { command: string; args?: readonly string[]; env?: Record<string, string | undefined> }): () => void {
+    const gate = this.gate(session);
+    gate.watchers++;
+    gate.spec = { command: spec.command, args: [...spec.args ?? []], env: { ...spec.env } };
+    let watching = true;
+    return () => {
+      if (!watching) return;
+      watching = false;
+      gate.watchers--;
+      gate.lastUsed = Date.now();
+    };
+  }
+
+  /** Resolves once an idle close of this browser in progress is over. */
+  async settled(session: string): Promise<void> { await this.gates.get(session)?.idleClose; }
+
+  /** Close a browser nothing has used for `idleMs`: no bot call (one waiting
+   * in or holding the lane, its page reads and recorded step, fill_login's
+   * typing), no preview frame being taken, no person's hold or input, no open
+   * live view (the caller checks that no turn holds it). Saved sign-ins
+   * stay, and the next call opens it again. The same barrier as a restart,
+   * so nothing reaches the browser while it closes, and like a restart it
+   * leaves nothing of the page behind (relay port, page health, refs). A
+   * browser attached to the person's own Chrome is never closed. `spec` is
+   * its launch settings for one nothing here has called yet (a turn that has
+   * not used it): its idle time starts at this first look. */
+  async closeIfIdle(session: string, idleMs: number, spec?: { command: string; args?: readonly string[]; env: Record<string, string | undefined> }): Promise<boolean> {
+    const gate = spec ? this.gate(session) : this.gates.get(session);
+    if (gate && !gate.spec && spec) gate.spec = { command: spec.command, args: [...spec.args ?? []], env: { ...spec.env } };
+    const launch = gate?.spec;
+    if (!gate || !launch || attachesToChrome(launch.env) || !(idleMs > 0) || Date.now() - gate.lastUsed < idleMs) return false;
+    if (gate.calls || gate.agents || gate.humans || gate.owner !== null || gate.closing || gate.releasing || gate.watchers || this.lanes.held(session)) return false;
+    gate.closing = true;
+    gate.ready = false;
+    let finished!: () => void;
+    gate.idleClose = new Promise((resolve) => { finished = resolve; });
+    this.changed(gate);
+    try {
+      if (!await this.closeBrowser(session, launch)) return false;
+      this.steps?.forget(session);
+      await this.clients.get(session)?.client.stop();
+      await this.clients.get(session)?.client.stop(); // see restart()
+      gate.uncertain = false;
+      gate.lostCall = null;
+      gate.idleClosed = true;
+      return true;
+    } catch {
+      return false;
+    } finally {
+      gate.closing = false;
+      gate.idleClose = undefined;
+      finished();
+      this.changed(gate);
+    }
   }
 
   /** Exclusive recovery. Unlike take(), this never waits through active work
@@ -626,6 +885,7 @@ export class BrowserRuntime {
     this.changed(gate);
     try {
       await closeBrowser();
+      this.steps?.forget(session);
       await this.clients.get(session)?.client.stop();
       // A tools/list admitted before closing set in can register a client
       // while that stop awaits; registration is synchronous, so one re-check
@@ -659,6 +919,7 @@ export class BrowserRuntime {
     this.changed(gate);
     try {
       if (!await closeBrowser()) throw new Error("The browser could not be closed. Ask the person to press Restart in the Browser panel of OpenMausBot on their computer, or to restart OpenMausBot.");
+      this.steps?.forget(session);
       await this.clients.get(session)?.client.stop();
       await this.clients.get(session)?.client.stop(); // see restart()
       gate.uncertain = false;
@@ -679,6 +940,7 @@ export class BrowserRuntime {
     const gate = this.gate(session);
     gate.closing = true;
     gate.ready = false;
+    this.steps?.forget(session);
     // Clear before the awaited stop: any uncertain latch after this point must win.
     gate.uncertain = false;
     gate.lostCall = null;
@@ -686,7 +948,7 @@ export class BrowserRuntime {
     await this.clients.get(session)?.client.stop();
     gate.closing = false;
     this.changed(gate);
-    if (!gate.owner && !gate.agents && !gate.humans) { this.gates.delete(session); this.toolLists.delete(session); }
+    if (!gate.owner && !gate.agents && !gate.humans && !gate.watchers && !gate.calls) { this.gates.delete(session); this.toolLists.delete(session); }
   }
 
   async closeAll(): Promise<void> {

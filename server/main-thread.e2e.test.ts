@@ -67,7 +67,7 @@ it("stamps askedAt where a person writes, never for a routine, a webhook, start_
         { reply: "Hand-off done." },
       ] },
       [teammate.id]: { turns: [
-        { steps: [{ tool: "send_to_bot", arguments: { bot_id: bot.id, title: "Hand-off", message: "Take this over." } }], reply: "Handed it over." },
+        { steps: [{ arguments: { bot_ids: [bot.id], message: "Take this over.", thread: "new", reply: "none" } }], reply: "Handed it over." },
       ] },
     }));
     const first = bot.activeTaskId as string;
@@ -79,7 +79,7 @@ it("stamps askedAt where a person writes, never for a routine, a webhook, start_
     expect(side.openedBy).toMatchObject({ botId: bot.id });
 
     // Slack's worker relays a person's line through the guarded route.
-    const { task: relayed } = await api("POST", `/api/bots/${bot.id}/tasks`, { title: "From Slack" }, 201);
+    const { task: relayed } = await api("POST", `/api/bots/${bot.id}/tasks`, { title: "From Slack", approvalMode: "ask" }, 201);
     await api("POST", `/api/bots/${bot.id}/messages/guarded`, {
       threadId: relayed.threadId, sendId: randomUUID(), text: "Sent from Slack.", expectedActiveLeafId: null,
     }, 202);
@@ -103,10 +103,11 @@ it("stamps askedAt where a person writes, never for a routine, a webhook, start_
     await replied(bot.id, webhookThread, "Webhook handled.");
 
     await cli("send", "--bot", teammate.id, "--task", teammate.activeTaskId, "--text", "Hand this to Asker.");
-    const handoff = await thread(bot.id, "Hand-off");
+    // A thread opened with coordinate_bots is titled by its message.
+    const handoff = await thread(bot.id, "Take this over.");
     await replied(bot.id, handoff.threadId, "Hand-off done.");
     await idle(teammate.id);
-    // The hand-off (send_to_bot, an alias of coordinate_bots with thread "new"
+    // The hand-off (coordinate_bots with thread "new"
     // and reply "none") is an assignment on the job runtime: its request line
     // in the opened thread is the teammate's, never the person's.
     const handed = (await api("GET", `/api/threads/${handoff.threadId}/messages?limit=50`)).messages as any[];

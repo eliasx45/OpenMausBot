@@ -13,7 +13,7 @@ import {
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
-import type { BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, InstalledPackageMetadata, LiveCallState, LiveSettings, ServerFrame, GroupThreadUsage, SteerQueueReason } from "../../shared/wire";
+import type { BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, InstalledPackageMetadata, LiveCallState, ServerFrame, GroupThreadUsage, SteerQueueReason } from "../../shared/wire";
 import { DATA_ROUTES, type DataSheet, type DataTable } from "../../shared/data-surface";
 import type { TurnDigest } from "../../shared/digest";
 import type { ToolScope } from "../../shared/tool-scope";
@@ -41,6 +41,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { botShowsUnread } from "@/lib/bot-unread";
 import { firstUnreadMessageId, threadOpensUnread, threadReadCursor } from "@/lib/unread-divider";
 import type { ComputerStart } from "@/lib/computer-start";
+import { parseComputerHelp } from "@/lib/computer-control";
 import { answerResponse, dismissResponse } from "@/lib/card-answer";
 import { currentCall } from "@/lib/call";
 import { readLastConversation, rememberConversation } from "@/lib/last-conversation";
@@ -52,7 +53,6 @@ import { roleProfilePatch, type BotRole } from "@/lib/bot-roles";
 import { t } from "@/lib/i18n";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { useChatErrorClear } from "./chat-error";
-import type { OnboardingStatus } from "@/lib/onboarding";
 import { openLiveEvents, publishLiveFrame, publishMissedFrames } from "@/lib/live-events";
 
 const MAX_ROUTINE_RUNS = 2_000;
@@ -151,6 +151,8 @@ export interface ConnectorCardData {
   error?: string;
   dismissed?: boolean;
   resumed?: boolean;
+  /** Stop ended the turn this card paused: no action, nothing resumes (shared/wire.ts). */
+  stopped?: boolean;
 }
 
 export interface SecretRequestCardData {
@@ -167,12 +169,19 @@ export interface SecretRequestCardData {
   superseded?: boolean;
   resumed?: boolean;
   error?: string;
+  /** Stop ended the turn this card paused: no entry, nothing resumes (shared/wire.ts). */
+  stopped?: boolean;
 }
 
-export interface Message {
+/** Who is driving a bot's computer: held = the person has the wheel (the
+ * bot's hands are refused server-side); helpReason = the bot's open plea for
+ * the person to take over, and help = the sign-in card it stands for. */
+export type ComputerControlState = { held: boolean; helpReason: string | null; help?: import("../../shared/wire").ComputerHelpRef | null };
+
+export interface Message extends Pick<import("../../shared/wire").WireMessage, "widget"> {
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run" | "digest" | "compaction" | "call";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "signin" | "routine.run" | "goal.run" | "digest" | "compaction" | "call" | "widget";
   text?: string;
   /** digest messages: what the turn did, rendered in `text` and structured here. */
   digest?: TurnDigest;
@@ -183,6 +192,7 @@ export interface Message {
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  signIn?: import("../../shared/wire").SignInRequestCardData;
   /** Lifecycle mirror for a routine whose real work lives in a fresh task. */
   routineRun?: RoutineRunCardData;
   /** Durable lifecycle receipt for a goal-driven channel run. */
@@ -229,7 +239,7 @@ export interface Message {
   /** rooms: which member said this (sender attribution). */
   from?: { botId: string; name: string; color: MausColor };
   /** a user-role line another bot delivered into this conversation
-   * (ask_bot, delegate_bot, start_thread): the words are that bot's, not
+   * (coordinate_bots, start_thread): the words are that bot's, not
    * the person's. Rendered as the peer speaking — see lib/peer-message. */
   peerAsk?: { botId: string; name: string; unattended?: boolean };
   /** coordinate_bots delivery identity, as stored: the request a teammate
@@ -258,6 +268,8 @@ export type GroupDefaultResponder = import("../../shared/wire").GroupDefaultResp
 /** A room: several bots + you in one shared thread. */
 export interface Group {
   usage?: GroupThreadUsage | null;
+  /** Each member's context in the active thread (WireGroup.memberContext). */
+  memberContext?: import("../../shared/wire").WireGroup["memberContext"];
   id: string;
   threadId: string;
   name: string;
@@ -269,7 +281,7 @@ export interface Group {
    * conversation. The New divider goes after it. */
   lastReadMessageId?: string;
   createdAt: number;
-  /** auto-created bot⇄bot channel (ask_bot exchanges mirror here) */
+  /** auto-created bot⇄bot channel (bot-to-bot exchanges mirror here) */
   dm?: boolean;
   busyBotId?: string | null;
   /** when the busy member's turn started — the group-side twin of a task's
@@ -293,6 +305,9 @@ export interface Group {
   /** A direct-message conversation's turn ceiling. Null or absent uses the
    * global group limit. Channel conversations store theirs on each task. */
   turnTimeoutMinutes?: number | null;
+  /** Members the person stopped in this room ("stop @Bot"), by bot id. */
+  holds?: Record<string, import("../../shared/wire").RoomHold>;
+  heldMessages?: Record<string, import("../../shared/wire").RoomHeldMessage[]>;
   /** Separate conversations in this channel. DMs deliberately stay on one
    * thread and omit this collection. */
   tasks?: GroupTask[];
@@ -347,6 +362,8 @@ export interface Task {
   updatedAt?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
+  /** Prompt-cache keep-warm status (server-derived, never stored). */
+  cacheKeepWarm?: import("../../shared/wire").CacheKeepWarmStatus;
   /** folder this task's turns run in, pinned on its first turn; null =
    * legacy home-folder session; absent = not pinned yet */
   cwd?: string | null;
@@ -500,7 +517,7 @@ export interface Bot {
   chiefOfStaff?: boolean;
   /** Additional teams the owner explicitly lets this Chief work with. */
   managedSections?: string[];
-  /** When this bot wants to talk to another bot (ask_bot/delegate_bot),
+  /** When this bot wants to talk to another bot (coordinate_bots),
    * pause and ask the user first. Off by default. */
   approvePeerComms?: boolean;
   /** Explicit peer allow-list (bot ids); absent = every bot in its section,
@@ -519,9 +536,12 @@ export interface Bot {
   fallback?: Array<{ instanceId: string; model: string }>;
   /** Whether this bot gets the app's built-in browser (Browser tab). On unless switched off. */
   browser?: boolean;
-  /** Memory upkeep (Bot settings → Memory): background capture and the
-   * nightly tidy-up. On unless explicitly false. */
+  recordBrowserSteps?: boolean; // Access → Browser → Record browser steps; off unless true
+  /** Memory upkeep (Bot settings → Memory): capture and the nightly tidy-up. On unless false. */
   memoryUpkeep?: boolean;
+  /** Prompt-cache keep-warm for this bot's Claude threads: true/false
+   * overrides the workspace setting, absent follows it (null clears over PATCH). */
+  cacheKeepWarm?: boolean | null;
   /** Which app-wide MCP servers (Plugins → MCP servers) this bot mounts, by
    * name. Absent = every enabled server; [] = none (null clears over PATCH). */
   mcpServers?: string[] | null;
@@ -555,6 +575,15 @@ export interface BotProject {
 }
 
 export type ProjectUpdatePatch = { name?: string; emoji?: string | null };
+
+/** The level each of a bot's threads runs at: its own, else the bot's (as
+ * currentTaskBot resolves it). */
+export function threadApprovalModes(bot: Pick<Bot, "approvalMode" | "autoApprove" | "tasks">): ApprovalMode[] {
+  return (bot.tasks ?? []).map((task) => approvalModeFor({
+    approvalMode: task.approvalMode ?? (task.autoApprove === undefined ? bot.approvalMode : undefined),
+    autoApprove: task.autoApprove ?? bot.autoApprove,
+  }));
+}
 
 /** A conversation uses its own execution settings; the sidebar keeps the
  * original bot's aggregate presence and profile defaults. */
@@ -672,133 +701,8 @@ export function visibleMessages(bot: Pick<Bot, "messages" | "activeLeafId">): Me
   return path.reverse();
 }
 
-/** GET /api/config — configured flags only; secrets are never echoed. */
-export interface ConfigStatus {
-  xai?: { configured: boolean };
-  mistral?: { configured: boolean };
-  cerebras?: { configured: boolean };
-  groq?: { configured: boolean };
-  /** `everyClaudeBot`: the key runs every Claude bot, not only "Claude (API key)". */
-  anthropic?: { configured: boolean; everyClaudeBot?: boolean };
-  openai?: { configured: boolean };
-  openrouter?: { configured: boolean };
-  openaiCompat?: { configured: boolean; url?: string };
-  /** what this server is entitled to; Settings shows only what works here.
-   * `license` reaches admins only, and only while the key is inside its
-   * warning window or grace period. */
-  edition?: {
-    edition: "oss" | "enterprise";
-    features: string[];
-    license?: { expiresAt: string; expiresInDays: number; graceEndsAt?: string };
-  };
-  /** a fleet agent exists on this server (Settings → Workspaces) */
-  fleet?: { available: boolean };
-  budgets?: { monthlyUsd?: number; warnAtPercent?: number };
-  billing?: { currency?: string; prices?: Record<string, { inputPerMillion: number; outputPerMillion: number; cachedInputPerMillion?: number }> };
-  composio: { configured: boolean; mode?: "managed" | "self-hosted" | "unavailable" };
-  /** `included`: cloud computers come with Cloud Pro, no key is saved. */
-  box: { configured: boolean; included?: boolean };
-  vps: { configured: boolean; sshAlias: string };
-  rooms: { turnTimeoutMinutes: number };
-  /** Per-call ceiling (minutes) for a bot's MCP tools. Absent from servers
-   * older than the setting; read it with mcpCallTimeoutMinutes(). */
-  mcp?: { callTimeoutMinutes: number };
-  /** Workspace defaults for new bots; absent effort = no level is sent. */
-  newBots?: { effort?: EffortLevel };
-  threads?: { maxConcurrentPerBot: number; eventLogMaxBytes?: number; eventLogRetentionDays?: number };
-  automaticRecovery?: { enabled: boolean; backup?: ModelSelection };
-  localVm: { mode: "shared" | "per-bot" | "pool"; maxInstances: number; idleTimeoutMinutes?: number };
-  /** `providerKeys`: names of the keys saved for OpenCode's other
-   * providers, never the keys. */
-  opencodeGo?: { configured: boolean; providerKeys?: string[] };
-  /** Voice. `configured` = the engine has what it needs (an ElevenLabs or
-   * Fish Audio key, or a Chatterbox server address); `ready` = that AND a voice, which is
-   * what it takes to actually speak. The key itself is never echoed back;
-   * `baseUrl`/`model` are Chatterbox settings, not credentials. */
-  tts?: {
-    configured: boolean;
-    ready: boolean;
-    voice: string;
-    provider?: "elevenlabs" | "fish" | "system" | "chatterbox" | "xai";
-    baseUrl?: string;
-    model?: string;
-    /** Fish Audio speech model; present only while Fish is the provider. */
-    fishModel?: "s2.1-pro" | "s2.1-pro-free";
-    /** ElevenLabs voice comes with Cloud Pro; no key is saved. */
-    included?: boolean;
-  };
-  /** The decision model: switches and whether a key is on file. The key
-   * itself never comes back. `enabled` is the switch as it takes effect
-   * (off while no key is saved). `included`: Cloud Pro's decisions, no key
-   * saved. */
-  decider?: {
-    provider: "jev";
-    configured: boolean;
-    included?: boolean;
-    enabled: boolean;
-    jobs: { roomRouting: boolean };
-  };
-  /** Live calls (OpenAI GPT-Live): configured-or-not, never the key. */
-  live?: LiveSettings;
-  /** Shared write-only credential for on-demand GPT Image avatars. */
-  imageGen?: {
-    configured: boolean;
-    provider?: "openai" | "xai" | "custom";
-    model?: string;
-    customUrl?: string;
-    customModel?: string;
-    openaiConfigured?: boolean;
-    xaiConfigured?: boolean;
-    customKeyConfigured?: boolean;
-  };
-  /** who's using the app — collected in onboarding, shown in the sidebar */
-  profile?: { name: string; email: string; aboutMe?: string };
-  /** UI language override; "" (or absent) follows the system language. */
-  language?: string;
-  /** Opt-in flags. Absent means off. */
-  features?: { skillAuthoring: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean; skillsLibrary?: boolean };
-  /** First-run progress: whether the welcome tour was finished and which
-   * one-time hints were dismissed. Server-owned so it follows the workspace. */
-  onboarding?: OnboardingStatus;
-  /** Which browser this server can give bots: the desktop app's surface, the
-   * agent-browser engine, or nothing yet (with the reason). */
-  browserEngine?: BrowserEngineSummary;
-  /** Named browser sessions any bot can be pointed at. */
-  browserProfiles?: BrowserProfile[];
-  /** The enrolled organisation's read-only desktop policy; null when this
-   * desktop is not enrolled or its Admin sends no policy. */
-  managedPolicy?: ManagedPolicySummary | null;
-  /** This server is an OMB Cloud home: it offers no "this computer" and no
-   * Local VM (server/cloud-home.ts). Absent everywhere else. */
-  cloudHome?: boolean;
-}
-
-export interface ManagedPolicySummary {
-  organizationName: string;
-  version: number;
-  companyModelsOnly: boolean;
-  allowedEngines: "all" | string[];
-  mcp: { allowCustom: boolean; allowlist: string[] };
-  computers: { thisComputer: boolean; localVm: boolean; box: boolean; vps: boolean };
-  remoteAccess: boolean;
-}
-
-export interface BrowserEngineSummary {
-  kind: "engine" | "unavailable";
-  reason?: string;
-  installable?: boolean;
-  version?: string;
-  installing?: boolean;
-  installError?: string;
-}
-
-export interface BrowserProfile {
-  id: string;
-  name: string;
-  /** Read-only durable Electron routing inherited from legacy profiles.
-   * Config PATCH payloads must omit it. */
-  partitionId?: string;
-}
+import type { BrowserEngineSummary, BrowserProfile, ConfigStatus, ManagedPolicySummary } from "./config-status";
+export type { BrowserEngineSummary, BrowserProfile, ConfigStatus, ManagedPolicySummary };
 
 // Every section the server's config frame carries. A section left out here
 // is wiped from state.config whenever a live frame lands, so whichever of a
@@ -806,7 +710,7 @@ export interface BrowserProfile {
 // Settings shows (a saved key's Test button used to vanish that way).
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "mistral" | "cerebras" | "groq" | "anthropic" | "openai" | "openrouter" | "openaiCompat" | "fleet" | "composio" | "box" | "vps" | "rooms" | "mcp" | "threads" | "automaticRecovery" | "localVm" | "opencodeGo" | "tts" | "decider" | "imageGen" | "live" | "profile" | "language" | "features" | "onboarding" | "browserEngine" | "browserProfiles" | "edition" | "budgets" | "billing" | "managedPolicy" | "cloudHome"
+  "xai" | "mistral" | "cerebras" | "groq" | "meta" | "anthropic" | "openai" | "openrouter" | "openaiCompat" | "fleet" | "composio" | "box" | "vps" | "rooms" | "mcp" | "threads" | "automaticRecovery" | "cacheKeepWarm" | "localVm" | "opencodeGo" | "tts" | "decider" | "imageGen" | "live" | "profile" | "language" | "features" | "onboarding" | "browserEngine" | "browserProfiles" | "edition" | "budgets" | "billing" | "managedPolicy" | "cloudHome"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -815,6 +719,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     mistral: frame.mistral,
     cerebras: frame.cerebras,
     groq: frame.groq,
+    meta: frame.meta,
     anthropic: frame.anthropic,
     openai: frame.openai,
     openrouter: frame.openrouter,
@@ -827,6 +732,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     mcp: frame.mcp,
     threads: frame.threads,
     automaticRecovery: frame.automaticRecovery,
+    cacheKeepWarm: frame.cacheKeepWarm,
     localVm: frame.localVm,
     opencodeGo: frame.opencodeGo,
     tts: frame.tts,
@@ -919,6 +825,9 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** This engine can make the quick background model call memory upkeep
+     * and the skill review use. */
+    backgroundText?: boolean;
   };
   /** `custom` agents sit below the rail divider — no subscription catalog. */
   access?: "subscription" | "custom" | "api";
@@ -952,6 +861,7 @@ export type AppSettingsSection =
   | "companion"
   | "remote"
   | "computer"
+  | "logins"
   | "usage"
   | "people"
   | "activity"
@@ -1062,10 +972,7 @@ export interface AppState {
   /** Bot removals waiting for the server to verify that no persistent
    * computer would be orphaned. The bot stays visible until that succeeds. */
   deletingBots: Record<string, true>;
-  /** who is driving each bot's computer: held = the person has the wheel
-   * (the bot's hands are refused server-side); helpReason = the bot's open
-   * plea for the person to take over */
-  computerControl: Record<string, { held: boolean; helpReason: string | null }>;
+  computerControl: Record<string, ComputerControlState>;
   /** Each bot's data sheet (cards and loaded tables, never rows), loaded
    * when its Data tab first opens and replaced whole by every `data` frame.
    * The grid pages rows itself, so a sheet stays small. */
@@ -1074,6 +981,9 @@ export interface AppState {
    * list, not a copy on the sheet, so a load and a CREATE agree. */
   dataTables: Record<string, DataTable[]>;
   dataResultFocus: { botId: string; id: string; requestId: number; consumed: boolean } | null;
+  /** A sign-in card's Open: the Computer panel goes to the place the bot
+   * works, the Browser tab already in the person's control. */
+  signInFocus: { botId: string; messageId: string; url: string; site: string; place: import("../../shared/wire").Surface; requestId: number; consumed: boolean } | null;
   /** Only the currently mounted Data view, not the last Open in Data request. */
   dataView: import("@/lib/composer-attachments").DataViewContext | null;
   /** a search hit to scroll to once its thread is on screen; nonce lets the
@@ -1088,7 +998,10 @@ export interface AppState {
   hydrated?: true;
   error: string | null;
   /** a quiet, non-error line above the transcript; clears itself */
-  notice: { kind: "thread-gone" | "bot-gone"; botName: string | null } | null;
+  /** A quiet one-line status: a reference that no longer resolves, or a
+   * pressed Steer the running engine could not take (pictures it cannot
+   * read mid-turn — the words stay queued for the next turn). */
+  notice: { kind: "thread-gone" | "bot-gone" | "steer-images"; botName: string | null } | null;
   /** a thread the person asked to open (chip or #Title link): the sidebar
    * expands its bot and scrolls the row into view once it is current */
   revealThread: { threadId: string; nonce: number } | null;
@@ -1198,7 +1111,7 @@ export type Action =
       bots: Bot[];
       groups: Group[];
       sections?: string[];
-      computerControl: Record<string, { held: boolean; helpReason: string | null }>;
+      computerControl: Record<string, ComputerControlState>;
       botQueuedMessages?: AppState["pendingQueued"];
       /** the conversation open on this device last launch, for the first hydrate */
       resumeId?: string;
@@ -1251,6 +1164,8 @@ export type Action =
   | { type: "setConversationTurnLimit"; groupId: string; threadId: string; minutes: number | null; dm: boolean }
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "interruptGroup"; groupId: string; threadId?: string; onError?: () => void }
+  /** Hold (stop) or release one member of a room without stopping the room. */
+  | { type: "setGroupHold"; groupId: string; botId: string; held: boolean }
   | { type: "instances"; instances: InstanceInfo[] }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "liveCall"; call: LiveCallState | null }
@@ -1338,7 +1253,7 @@ export type Action =
    * plain send falls back to the removed row's parent. */
   | { type: "optimisticMessageRemoved"; threadId: string; sendId: string; restoreLeafId?: string | null }
   | { type: "computerStart"; botId: string; start: ComputerStart | null }
-  | { type: "computerControl"; botId: string; held: boolean; helpReason: string | null }
+  | ({ type: "computerControl"; botId: string } & ComputerControlState)
   /** A whole sheet from the server: a `data` frame or the first GET. */
   | { type: "dataSheet"; sheet: DataSheet; tables?: DataTable[] }
   | { type: "dataView"; view: AppState["dataView"] }
@@ -1357,6 +1272,8 @@ export type Action =
   | { type: "toggleComputer"; open?: boolean }
   | { type: "openDataResult"; botId: string; cardId: string }
   | { type: "dataResultFocusConsumed"; requestId: number }
+  | { type: "openSignIn"; botId: string; messageId: string; url: string; site: string; place: import("../../shared/wire").Surface }
+  | { type: "signInFocusConsumed"; requestId: number }
   | { type: "toggleInspector"; open?: boolean }
   | { type: "toggleActivity"; open?: boolean }
   | { type: "focusMessage"; threadId: string; messageId: string; matchText?: string }
@@ -2140,7 +2057,7 @@ export function reducer(state: AppState, action: Action): AppState {
         ...state,
         computerControl: {
           ...state.computerControl,
-          [action.botId]: { held: action.held, helpReason: action.helpReason },
+          [action.botId]: { held: action.held, helpReason: action.helpReason, help: action.help ?? null },
         },
       };
     case "modelVariantRuntime": {
@@ -2278,6 +2195,17 @@ export function reducer(state: AppState, action: Action): AppState {
     case "dataResultFocusConsumed":
       return state.dataResultFocus?.requestId === action.requestId
         ? { ...state, dataResultFocus: { ...state.dataResultFocus, consumed: true } } : state;
+    case "openSignIn": {
+      if (!state.bots.some((bot) => bot.id === action.botId)) return state;
+      // As Open in Data: the bot's own view (a room's card leaves the room),
+      // then its Computer panel at the place the sign-in must happen.
+      const selected = reducer(reducer(state, { type: "select", id: action.botId }), { type: "toggleComputer", open: true });
+      const { type: _, ...request } = action;
+      return { ...selected, signInFocus: { ...request, requestId: (state.signInFocus?.requestId ?? 0) + 1, consumed: false } };
+    }
+    case "signInFocusConsumed":
+      return state.signInFocus?.requestId === action.requestId
+        ? { ...state, signInFocus: { ...state.signInFocus, consumed: true } } : state;
     case "toggleComputer": {
       const open = action.open ?? !state.computerOpen;
       return {
@@ -2378,6 +2306,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const {
         acknowledgeLocalAuto: _localAck,
         applyToAllThreads: _allThreads,
+        keepThreadModels: _keepThreadModels,
         computer,
         connectorTools,
         connectorScopes,
@@ -2635,6 +2564,7 @@ export function reducer(state: AppState, action: Action): AppState {
     case "createGroup":
     case "deleteGroup":
     case "interruptGroup":
+    case "setGroupHold":
     case "steerGroupQueued":
     case "createRoutine":
     case "updateRoutine":
@@ -2747,6 +2677,7 @@ export const initialState: AppState = {
   dataSheets: {},
   dataTables: {},
   dataResultFocus: null,
+  signInFocus: null,
   dataView: null,
   focusMessage: null,
   unreadDivider: null,
@@ -2907,9 +2838,11 @@ export async function persistBotUpdate(
     applyToAllThreads,
     ...ordinaryPatch
   } = patch;
-  const leavesCustom = approvalMode !== undefined &&
-    approvalModeFor(currentBot ?? {}) === "custom" &&
-    approvalMode !== "custom";
+  // Leaving Custom takes the private channel, for the bot or, when the level
+  // goes to every thread, for any thread still on Custom.
+  const leavesCustom = approvalMode !== undefined && approvalMode !== "custom" &&
+    (approvalModeFor(currentBot ?? {}) === "custom" ||
+      (applyToAllThreads === true && threadApprovalModes(currentBot ?? {}).includes("custom")));
   const viaBridge = approvalMode === "custom" || leavesCustom ||
     (approvalMode === "full" && trustedApprovals !== undefined);
 
@@ -2920,7 +2853,7 @@ export async function persistBotUpdate(
         approvalMode === undefined ? ordinaryPatch : {
           ...ordinaryPatch,
           approvalMode,
-          ...(approvalMode === "full" && applyToAllThreads ? { applyToAllThreads: true } : {}),
+          ...(applyToAllThreads ? { applyToAllThreads: true } : {}),
         },
       ),
       signal,
@@ -3409,6 +3342,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 for (const queueId of body.queueIds ?? []) {
                   rawDispatch({ type: "consumePendingQueued", threadId: body.threadId, queueId });
                 }
+              } else if (body?.queued === true && body.blockedBy === "images") {
+                // Pressed Steer, but the engine cannot take pictures mid-turn:
+                // say why the message is still queued instead of nothing.
+                wrapped({ type: "notice", notice: { kind: "steer-images", botName: null } });
               }
               action.onSettled?.();
             })
@@ -3438,6 +3375,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 for (const queueId of body.queueIds ?? []) {
                   rawDispatch({ type: "consumePendingQueued", threadId: body.threadId, queueId });
                 }
+              } else if (body?.queued === true && body.blockedBy === "images") {
+                // Pressed Steer, but the engine cannot take pictures mid-turn:
+                // say why the message is still queued instead of nothing.
+                wrapped({ type: "notice", notice: { kind: "steer-images", botName: null } });
               }
               action.onSettled?.();
             })
@@ -3954,6 +3895,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             .then((r) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
             .catch(showError);
           break;
+        case "setGroupHold":
+          api<{ group?: Partial<Group> & { id: string } }>(`/api/groups/${action.groupId}/holds`, {
+            method: "POST",
+            body: JSON.stringify({ botId: action.botId, held: action.held }),
+          })
+            .then((r) => r?.group && dispatch({ type: "groupPatched", group: r.group }))
+            .catch(showError);
+          break;
         case "interruptGroup":
           api(`/api/groups/${action.groupId}/interrupt`, {
             method: "POST",
@@ -4314,6 +4263,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             botId: frame.botId,
             held: frame.held === true,
             helpReason: typeof frame.helpReason === "string" ? frame.helpReason : null,
+            help: parseComputerHelp(frame.help),
           });
           break;
         case "data":

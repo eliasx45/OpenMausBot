@@ -1,4 +1,4 @@
-import { Component, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type ReactNode } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch } from "react";
 import { useAdvancedMode } from "@/lib/interface-mode";
 import { ThreadLinkContext } from "@/components/ThreadLinkMenu";
 import { useShowThreads } from "@/lib/thread-preferences";
@@ -33,6 +33,7 @@ import { localSystemVoiceActive } from "@/lib/local-voice";
 import { computerStartLine } from "@/lib/computer-start";
 import { useCaptionChrome, useDesktopCapabilities } from "@/components/DesktopCapabilities";
 import { contextChip, contextDetail, contextShare, costCaption, formatUsd, hasFiniteCost, lastTurnDetail, usageChip, usageDetail } from "@/lib/usage";
+import { keepWarmLine } from "@/lib/cache-keepwarm";
 import {
   api,
   currentTaskBot,
@@ -86,15 +87,17 @@ import { userBubbleStyle } from "@/lib/user-bubble-tone";
 import { ToolActivity } from "./ToolActivity";
 import { DataResultChip } from "./DataResultChip";
 import { ThreadRefText } from "./ThreadRefs";
-import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
-import { ApprovalCard } from "./ApprovalCard";
-import { QuestionCard } from "./QuestionCard";
+import { optionsCardRow } from "./OptionsCardRow";
+import { MessageBoundary } from "./MessageBoundary";
+import { WidgetMessage } from "./widget/WidgetMessage";
 import { Composer } from "./Composer";
 import { ChatErrorBanner, ChatNotice } from "./ChatErrorBanner";
+import { ThreadContextWarning } from "./ContextWarning";
 import { ChatFindBar } from "./ChatFindBar";
 import { ReplyQuote } from "./ReplyQuote";
 import { ConnectorCard } from "./ConnectorCard";
 import { SecretRequestCard } from "./SecretRequestCard";
+import { SignInRequestCard } from "./SignInRequestCard";
 import { hasRoutineExecutionTask, RoutineRunCard } from "./RoutineRunCard";
 import { CallRecordRow } from "./CallRecordRow";
 import { AttachmentGallery, collectMessageFiles, replyAttachmentGroup, splitMessageAttachments } from "./AttachmentGallery";
@@ -402,24 +405,8 @@ export function FailedTurnRow({ tool, engine, onRetry, botId, threadId }: {
   );
 }
 
-/** One bad markdown node must not white-screen the app — the transcript
- * degrades to a plain-text bubble instead. Rooms use the same boundary. */
-export class MessageBoundary extends Component<{ children: ReactNode; fallbackText: string }, { failed: boolean }> {
-  state = { failed: false };
-  static getDerivedStateFromError() {
-    return { failed: true };
-  }
-  render() {
-    if (this.state.failed) {
-      return (
-        <div className="chat-text w-fit max-w-[min(42rem,78%)] rounded-2xl bg-card px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap text-ink">
-          {this.props.fallbackText}
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
+/** The text fallback for a row that will not draw. Rooms import it from here. */
+export { MessageBoundary };
 
 /** Inline editor a user bubble turns into: the send key sends (forking the
  * conversation), Esc cancels. Any other Enter is a newline, like the composer. */
@@ -1004,32 +991,19 @@ const MessagesList = memo(function MessagesList({
               />
             );
           }
-          switch (m.kind) {
+          // a widget row whose tree never arrived still reads as its text
+          switch (m.kind === "widget" && !m.widget ? "text" : m.kind) {
             case "secret":
               return m.secret ? <SecretRequestCard botId={botId} threadId={threadId} message={m} /> : null;
+            case "signin":
+              return m.signIn ? <SignInRequestCard botId={botId} botName={botName} threadId={threadId} message={m} /> : null;
             case "connector":
               return m.connector ? <ConnectorCard botId={botId} threadId={threadId} message={m} /> : null;
-            case "options": {
-              // a live permission ask gets the approval box; a structured
-              // ask gets the question box; anything else keeps the list
-              // card. The first-run quiz drops out once they talk.
-              // Cards are bot-authored and persisted, so one that will not
-              // draw must fall back to its text on every open, not take the
-              // whole page down every time this chat is selected.
-              const card = m.card?.requestId && m.card.questionRequest ? (
-                <QuestionCard threadId={threadId} bot={{ name: botName }} message={m} />
-              ) : m.card?.requestId && m.card.tool ? (
-                <ApprovalCard bot={{ name: botName }} message={m} threadId={threadId} />
-              ) : shouldHideOnboardingCard(m, transcript) ? null : (
-                <OptionCard botId={botId} threadId={threadId} message={m} />
-              );
-              if (!card) return null;
-              return (
-                <MessageBoundary fallbackText={m.card?.subtitle || m.card?.title || ""}>
-                  {card}
-                </MessageBoundary>
-              );
-            }
+            case "options":
+              return optionsCardRow({ message: m, transcript, botId, botName, threadId });
+            case "widget":
+              // bot-authored and persisted: one that throws while drawing falls back to its text
+              return <MessageBoundary fallbackText={m.text ?? ""}><WidgetMessage botId={botId} threadId={threadId} message={m} /></MessageBoundary>;
             case "routine.run":
               return <RoutineRunRow message={m} botId={botId} />;
             case "call":
@@ -1521,6 +1495,7 @@ export function ChatView({ bot: profile }: { bot: Bot }) {
               <span className="@max-4xl/chathead:hidden">{t("chat.stop")}</span>
             </button>
           )}
+          <ThreadContextWarning bot={bot} messages={messages} />
           {!remoteClient && <ModelPicker key={bot.threadId} bot={bot} threadId={bot.threadId} />}
           {/* below md the sidebar (and its Live call pill) is hidden */}
           <LiveCallChip currentBotId={bot.id} onOpen={(botId, threadId) => openThread(dispatch, { botId, threadId }, state, showThreads)} />
@@ -1528,12 +1503,12 @@ export function ChatView({ bot: profile }: { bot: Bot }) {
             data-tour="computer"
             onClick={() => dispatch({ type: "toggleComputer" })}
             className={cn(
-              "rounded-md p-1.5 hover:bg-raised",
+              "relative rounded-md p-1.5 hover:bg-raised",
               state.computerOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
             )}
-            title={t("chat.computer")}
+            title={t("chat.computer")} aria-label={busy && place === "browser" ? `${t("chat.computer")}, ${t("place.live")}` : t("chat.computer")}
           >
-            <Monitor size={18} />
+            <Monitor size={18} />{busy && place === "browser" && <span aria-hidden="true" className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-success" data-testid="computer-button-live" />}
           </button>
           {/* Keep threads reachable even when the sidebar is collapsed.
               Less frequent actions share one menu. */}
@@ -1752,7 +1727,8 @@ export function NewConversationInstead({ onNew }: { onNew: () => void }) {
  * the engine reports one, else new tokens — with the full breakdown as the
  * tooltip. Null while the thread has no usage yet. */
 function usageSummary(bot: Bot, instances: AppState["instances"]): { short: string; detail: string; tone?: "danger" | "warning" } | null {
-  const usage = bot.tasks?.find((t) => t.threadId === bot.threadId)?.usage;
+  const task = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  const usage = task?.usage;
   if (!usage || !usageChip(usage)) return null;
   const billing = instances.find((i) => i.instanceId === bot.modelSelection.instanceId)?.snapshot.billing;
   const share = contextShare(usage);
@@ -1765,6 +1741,7 @@ function usageSummary(bot: Bot, instances: AppState["instances"]): { short: stri
     // model re-reading what it already saw — say so, or the figure reads as
     // a bug (issue #527); past 80% of the window the fix is a new thread
     share?.tone === "danger" ? t("chat.usage.contextNudge") : null,
+    keepWarmLine(task?.cacheKeepWarm),
     hasFiniteCost(usage.costUsd) ? `${formatUsd(usage.costUsd)} ${costCaption(billing)}` : null,
   ]
     .filter(Boolean)

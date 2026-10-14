@@ -58,7 +58,7 @@ function expectMemoryInTurn(request: ChatRequest, text: string) {
   expect(turn.slice(-text.length)).toBe(text);
 }
 
-it.each(["openaiCompat", "groq"] as const)("%s runs structured MCP calls through real harness approval and continuation, preserving text and cancellation", async instanceId => {
+it.each(["openaiCompat", "groq", "meta"] as const)("%s runs structured MCP calls through real harness approval and continuation, preserving text and cancellation", async instanceId => {
   const requests: ChatRequest[] = [];
   let scenario = "allow";
   const upstream = createServer(async (req, res) => {
@@ -146,7 +146,8 @@ it.each(["openaiCompat", "groq"] as const)("%s runs structured MCP calls through
       await api("PATCH", `/api/mcp/servers/${mode}`, { enabled: true });
       const { bot } = await control(["new-bot", "--name", `API tool ${mode}`]);
       await control(["set-model", "--bot", bot.id, "--instance", instanceId, "--model", "fixture-model"]);
-      await api("PATCH", `/api/bots/${bot.id}`, { mcpServers: [mode], description: "Verification assistant", soul: "Use structured tools when an operation is requested." });
+      // On Ask, so each structured call stops on the harness's own card.
+      await api("PATCH", `/api/bots/${bot.id}`, { mcpServers: [mode], approvalMode: "ask", description: "Verification assistant", soul: "Use structured tools when an operation is requested." });
       if (mode === "selected" || mode === "scope-empty") {
         await api("PATCH", `/api/bots/${bot.id}`, { toolScope: { allow: mode === "selected" ? [`mcp:${mode}:write_file`] : [] } });
       }

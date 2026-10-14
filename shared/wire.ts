@@ -24,6 +24,7 @@ import type { ModelRequestCardData } from "./model-request.ts";
 import type { SkillRequestCardData } from "./skill-request.ts";
 import type { QuestionRequestCardData } from "./ask-question.ts";
 import type { RoutineRunCardData } from "./routine-run.ts";
+import type { WidgetPayload } from "./widget.ts";
 import type { GroupGoalRunCardData } from "./group-goal-run.ts";
 import type { RuntimeEvent } from "./runtime-events.ts";
 import type { Notification } from "./notification.ts";
@@ -187,8 +188,20 @@ export interface WireTask {
   surfaceAuto?: true;
   /** what this task has spent, banked once per turn */
   usage?: TaskUsage;
+  /** Prompt-cache keep-warm status for this thread (server/cache-keepwarm.ts),
+   * derived at projection and never stored; absent when no window is open. */
+  cacheKeepWarm?: CacheKeepWarmStatus;
   /** the folder this task's turns run in, pinned on its first turn. */
   cwd?: string | null;
+}
+
+/** One thread's keep-warm window as a client shows it. Times are epoch ms. */
+export interface CacheKeepWarmStatus {
+  state: "warm" | "stopped";
+  until?: number;
+  nextPingAt?: number;
+  last?: { at: number; read: number; write: number; costUsd: number | null };
+  stopped?: string;
 }
 
 /** A lightweight organizational label within one bot. */
@@ -224,7 +237,7 @@ export interface InstalledPackageMetadata {
   agentKey?: string;
   /** Set when the bot was created from a package preset. */
   presetKey?: string;
-  /** What the package suggested. Never applied: imported bots start on Ask. */
+  /** What the package suggested. Never applied: imported bots start at the default level. */
   suggestedApproval?: "ask" | "auto";
   /** org only */
   publisher?: { organizationId: string; slug: string; name: string };
@@ -346,11 +359,18 @@ export interface WireBot {
   fallback?: Array<{ instanceId: string; model: string }>;
   /** Whether this bot gets the app's built-in browser. */
   browser?: boolean;
+  /** Record browser steps: a screenshot and a short note of each browser
+   * action, kept with the conversation (server/browser-steps.ts). Off
+   * unless true; an admin setting, and a team file may turn it on. */
+  recordBrowserSteps?: boolean;
   /** Memory upkeep: the harness captures facts from finished chats into
    * MEMORY.md and topic files, adds facts about the person to About me and
    * tidies nightly. On unless explicitly false; every change is journaled
    * and can be undone. */
   memoryUpkeep?: boolean;
+  /** Prompt-cache keep-warm for this bot's Claude threads: true or false
+   * overrides the workspace setting (Settings → Engines); absent follows it. */
+  cacheKeepWarm?: boolean;
   /** Which of the app-wide MCP servers this bot mounts, by name. */
   mcpServers?: string[];
   /** Owner-selected original tool identities. An empty allowlist permits none. */
@@ -408,7 +428,7 @@ export interface WireMessage {
   roomRequest?: { id: string; phase: "request" | "result" };
   id: string;
   role: "bot" | "user";
-  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run" | "digest" | "compaction" | "call";
+  kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "signin" | "routine.run" | "goal.run" | "digest" | "compaction" | "call" | "widget";
   text?: string;
   digest?: TurnDigest;
   compaction?: {
@@ -428,8 +448,14 @@ export interface WireMessage {
     | { kind: "audio"; path: string; mime: string; durationMs?: number }
   >;
   card?: OptionCardData;
+  /** widget rows (kind "widget"): a bot-authored UI tree (shared/widget.ts).
+   * `text` is always its readable fallback, for clients that do not know
+   * the kind. */
+  widget?: WidgetPayload;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
+  /** signin rows: the bot asked the person to sign in to a site themselves. */
+  signIn?: SignInRequestCardData;
   /** One idempotently updated status card for a routine run. */
   routineRun?: RoutineRunCardData;
   /** Terminal receipt for a bounded multi-bot channel goal. */
@@ -516,9 +542,9 @@ export interface WireMessage {
   /** A room reply whose speaker the decision model picked (an Auto room),
    * with how sure it was. Absent on every other message; clients that do
    * not know it ignore it. */
-  routedBy?: { provider: "jev"; probability: number };
+  routedBy?: { provider: "jev" | "openrouter"; probability: number };
   /** Set on the user-role line another bot delivered into this bot's own
-   * conversation (ask_bot, start_thread). `incident`: the line is
+   * conversation (coordinate_bots, start_thread). `incident`: the line is
    * OpenMausBot's Team incidents report about that bot's broken run in
    * `threadId` (server/incidents.ts), not its words; `notified`: that
    * failure already buzzed the person (a run that could not start, a
@@ -664,6 +690,9 @@ export interface ConnectorCardData {
   error?: string;
   dismissed?: boolean;
   resumed?: boolean;
+  /** Stop ended the turn this card paused: it offers no action, and a
+   * connection made afterwards is kept but continues nothing. */
+  stopped?: boolean;
 }
 
 export interface SecretRequestCardData {
@@ -682,6 +711,48 @@ export interface SecretRequestCardData {
   superseded?: boolean;
   resumed?: boolean;
   error?: string;
+  /** Stop ended the turn this card paused: it offers no entry, and a key
+   * saved afterwards is kept but continues nothing. */
+  stopped?: boolean;
+}
+
+/** A bot asked the person to sign in to a website themselves
+ * (shared/sign-in-request.ts): they type the password into the page, in the
+ * place the bot works, or save a login the server fills for the bot. The
+ * bot never sees the password either way. */
+export interface SignInRequestCardData {
+  /** The page to open, an http(s) address. */
+  url: string;
+  /** Its host, the card's headline. */
+  site: string;
+  /** The bot's own words: why it needs the sign-in. */
+  reason?: string;
+  /** Where the login has to happen: the place the asking turn worked in. */
+  place: Surface;
+  done?: boolean;
+  cancelled?: boolean;
+  /** A newer request for the same site in this conversation replaced this
+   * card; it no longer offers Done or Cancel. */
+  superseded?: boolean;
+  /** Answered by saving a login (shared/logins.ts): the exact host it was
+   * saved for, which the bot then fills with fill_login. */
+  savedLogin?: string;
+  resumed?: boolean;
+  error?: string;
+  /** Stop ended the turn this card paused: it offers no Done or Cancel,
+   * and an answer given afterwards is kept but continues nothing. */
+  stopped?: boolean;
+}
+
+/** The open sign-in request a bot's computer plea stands for, so whichever
+ * panel shows the plea can settle that card. */
+export interface ComputerHelpRef {
+  /** The asking bot: a team computer's plea reaches every member's panel. */
+  botId: string;
+  threadId: string;
+  messageId: string;
+  site: string;
+  place: Surface;
 }
 
 /** Who answers a room message nobody was @mentioned in. `auto` asks the
@@ -722,6 +793,10 @@ export interface GroupTask {
 export interface WireGroup {
   /** Computed from the usage ledger, not stored in groups.json. */
   usage?: GroupThreadUsage | null;
+  /** transient: each member's context in the active thread, from its last
+   * turn there (server/room-context.ts), and whether its next turn there
+   * was asked to start compacted. Absent until a member reports one. */
+  memberContext?: Record<string, { tokens: number; window: number; compactRequested?: true }> | null;
   id: string;
   /** The active task's thread. Direct-message channels stay single-threaded. */
   threadId: string;
@@ -766,6 +841,26 @@ export interface WireGroup {
   /** A direct-message channel's turn ceiling. Null on the wire means the
    * global group limit. Channel conversations store theirs on each task. */
   turnTimeoutMinutes?: number | null;
+  /** Members the person stopped in this room ("stop @Bot"), by bot id.
+   * A held member gets no turn until it is @mentioned again or resumed.
+   * Room-wide, persisted (server/room-holds.ts). */
+  holds?: Record<string, RoomHold>;
+  /** Room messages addressed to a member while it was held, by bot id;
+   * its next turn is shown them, then they are cleared. */
+  heldMessages?: Record<string, RoomHeldMessage[]>;
+}
+
+/** One member's hold in a room: when the person stopped it, and whether the
+ * room has already said so (the held line is written once per hold). */
+export interface RoomHold {
+  at: number;
+  noted?: boolean;
+}
+
+/** A room message that reached a member while it was held. */
+export interface RoomHeldMessage {
+  threadId: string;
+  messageId: string;
 }
 
 // ── live wire frames ───────────────────────────────────────────────────
@@ -828,7 +923,7 @@ export type ServerFrame =
    * one progress line until its first screen frame. `place` names a cloud
    * computer (absent: a Local VM). */
   | { kind: "computer"; botId: string; state: "provisioning" | "waking"; place?: "cloud" }
-  | { kind: "computer-control"; botId: string; held: boolean; helpReason: string | null }
+  | { kind: "computer-control"; botId: string; held: boolean; helpReason: string | null; help?: ComputerHelpRef | null }
   /** A bot's data sheet changed (a card added, updated, failed, removed; a
    * table loaded). Whole sheet each time: see shared/data-surface.ts. */
   | DataBroadcast

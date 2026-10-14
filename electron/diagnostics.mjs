@@ -16,6 +16,7 @@ export const CREDENTIAL_ENV_NAMES = [
   "MISTRAL_API_KEY",
   "CEREBRAS_API_KEY",
   "OMB_GROQ_API_KEY",
+  "OMB_META_API_KEY",
   "OMB_ANTHROPIC_API_KEY",
   "OMB_ANTHROPIC_API_URL",
   "OMB_HOSTED_MODEL_TOKEN",
@@ -29,6 +30,7 @@ export const CREDENTIAL_ENV_NAMES = [
   "OMB_TTS_KEY",
   "OMB_FISH_AUDIO_API_KEY",
   "OMB_JEV_API_KEY",
+  "OMB_OPENROUTER_DECIDER_KEY",
   "OMB_OPENAI_IMAGE_KEY",
   "OMB_CUSTOM_IMAGE_KEY",
   "OMB_OPENAI_LIVE_KEY",
@@ -42,6 +44,7 @@ export const CREDENTIAL_ENV_NAMES = [
   // though they are not traditional API credentials.
   "OMB_BROWSER_CONNECTION",
   "OMB_USER_DATA",
+  "OMB_BOAT_API",
 ];
 
 // Credential-shaped tokens (server/redact.ts parity): unmistakable formats

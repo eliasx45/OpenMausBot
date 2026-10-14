@@ -13,6 +13,7 @@
 import { CREDENTIAL_TARGETS } from "../../shared/credential-request.ts";
 import { OPTIONS_CARD_LIMITS, WATCHER_OPTIONS_CARD_BOT_ID } from "../../shared/options-card.ts";
 import { agentToolAnnotations } from "../agent-tool-policy.ts";
+import { WIDGET_TOOL_DEFINITIONS } from "./agents-widget-tools.ts";
 
 /** Which tools a turn is shown. The harness decides each of these when it
  * builds the integration (server/index.ts agentsIntegration); the server
@@ -205,16 +206,12 @@ const PROPOSAL_OUTCOME = " Read the result: granted Full Access may apply the ch
  * any level (server/direct-apply.ts). */
 const SELF_CHANGE_OUTCOME = " Read the result: a change to your own routines, skills, profile or model applies immediately, and the person sees it with an Undo; a change for another bot may wait for the person's confirmation. If applied, continue the requested work without another confirmation. Only a pending result requires ending the turn and waiting for the in-app decision. Never claim success without an applied result; report failed or cancelled results honestly. This does not elevate another bot's execution permissions.";
 
-/** The one sentence every deprecated alias opens with, naming its
- * replacement. The aliases stay for one release (docs/runtime-contract.md
- * §9); their results carry the same line (agents-call.ts). */
-const DEPRECATED_ALIAS = (replacement: string) => `Deprecated alias of ${replacement}; works for this release.`;
 /** start_thread's bot_id: the schema's enum (catalogTools) holds the bot's own id. */
 const START_THREAD_SELF_ID = "Leave out, or use your own bot ID. For teammates use coordinate_bots.";
 
 /** Every tool, in the order it is listed: one wording for every turn,
  * whether a person's chat, a routine run or a standing external runtime
- * reached it. The deprecated aliases come last. */
+ * reached it. */
 const TOOL_DEFINITIONS = [
   {
     name: "create_options_card",
@@ -374,6 +371,7 @@ const TOOL_DEFINITIONS = [
       required: ["path"],
     },
   },
+  ...WIDGET_TOOL_DEFINITIONS,
   {
     name: "post_to_room",
     description:
@@ -522,6 +520,32 @@ const TOOL_DEFINITIONS = [
         },
       },
       required: ["credential_id"],
+    },
+  },
+  {
+    name: "request_sign_in",
+    description:
+      "Ask the person to sign in to a website themselves, in the browser or on the computer you are using now. Use it when a page needs a login you do not have, or a one-time code, CAPTCHA or other step only they can do. They get a card and a notification, sign in where you work, and press Done. Never ask for a password or code in chat. After calling it, end your turn; OpenMausBot resumes you when they finish or decline, and then check you are signed in.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        site: { type: "string", minLength: 1, maxLength: 2048, description: "The page to sign in on: its address, or the domain, such as example.com." },
+        reason: { type: "string", maxLength: 240, description: "One short sentence, in your words, on what the sign-in is for." },
+      },
+      required: ["site"],
+    },
+  },
+  {
+    name: "fill_login",
+    description:
+      "Sign in with a login the person saved in OpenMausBot. Call it on the login page open in your browser: OpenMausBot types the username, password and any one-time code into the page itself, and you never see them. The page's host must be exactly the saved login's. On a two-step login it fills what is visible; go on to the next step and call it again. Then submit the form yourself. With no saved login for the site, call request_sign_in.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        username: { type: "string", maxLength: 512, description: "Which saved login to use when the site has more than one." },
+      },
     },
   },
   {
@@ -745,15 +769,15 @@ const TOOL_DEFINITIONS = [
   {
     name: "propose_team_memory",
     description:
-      "Propose something every bot on the team should know: who a person is (person), where something lives (place), what was decided (decision), or what a name means (term). Every addition or replacement waits for a workspace admin to confirm its card before entering shared prompts. End the turn and do not claim it is remembered before confirmation; accepted facts stay unchanged until then.",
+      "Propose a shared fact, decision, lesson, open question or outcome. Additions and replacements wait for admin review; accepted facts stay unchanged until then. End this turn while pending; do not claim it is remembered.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         kind: { type: "string", enum: ["person", "place", "decision", "term", "lesson", "question", "outcome"], description: "What kind of entry this is." },
-        name: { type: "string", maxLength: 120, description: "The person's name, the thing or document, the decision in a few words, or the term." },
-        detail: { type: "string", maxLength: 600, description: "One or two sentences: the person's role, where the thing lives, what was decided and where, what the term means." },
-        aliases: { type: "array", maxItems: 8, items: { type: "string", maxLength: 120 }, description: "Other names it goes by, for example a nickname or an abbreviation." },
+        name: { type: "string", maxLength: 120, description: "Short title or name." },
+        detail: { type: "string", maxLength: 600, description: "The fact, decision or result, with its context and brief rationale." },
+        aliases: { type: "array", maxItems: 8, items: { type: "string", maxLength: 120 }, description: "Other names or abbreviations." },
         key: { type: "string", maxLength: 240, description: "Stable project/fact key (tapa/colour). Reuse for corrections, even if the name changes." },
         evidence: { type: "object", additionalProperties: false, description: "For outcomes: files inside the working folder, fingerprinted by the server. Checked means agent-reported; owner approval is separate. Changed files invalidate evidence.",
           properties: { project: { type: "string" }, artifacts: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } }, stage: { type: "string", enum: ["rendered", "checked"] }, check: { type: "string", maxLength: 600, description: "What you actually checked and remaining limitations" } }, required: ["project", "artifacts", "stage", "check"] },
@@ -868,67 +892,6 @@ const TOOL_DEFINITIONS = [
       required: ["name"],
     },
   },
-  // ── Deprecated aliases: one release (docs/runtime-contract.md §9) ──────
-  // Each maps onto coordinate_bots or assignment_status (agents-call.ts), and
-  // its result carries one deprecation line. Routine prompts that name them
-  // keep working.
-  {
-    name: "delegate_bot",
-    description: `${DEPRECATED_ALIAS("coordinate_bots(bot_ids: [bot_id], message, reason)")} Hands work to one teammate; the result returns here and resumes you. Acknowledge the assignment and end your turn; do not check or wait for it in this turn.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        bot_id: { type: "string", description: "The target bot's id (from list_bots or your roster); a unique teammate name also resolves." },
-        message: { type: "string", description: "What the peer should do / answer." },
-        reason: { type: "string", description: "Optional one-line reason for the delegation (shown to the user as a chip)." },
-      },
-      required: ["bot_id", "message"],
-    },
-  },
-  {
-    name: "ask_bot",
-    description: `${DEPRECATED_ALIAS("coordinate_bots(bot_ids: [bot_id], message, consult: true)")} Asks one teammate a question; there is no inline wait any more: the answer resumes you after your turn ends, so end your turn once it is sent.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        bot_id: { type: "string", description: "The target bot's id (from list_bots or your roster); a unique teammate name also resolves." },
-        message: { type: "string", description: "What to say / ask the bot." },
-      },
-      required: ["bot_id", "message"],
-    },
-  },
-  {
-    name: "send_to_bot",
-    description: `${DEPRECATED_ALIAS("coordinate_bots(bot_ids: [bot_id], message, thread: \"new\", reply: \"none\")")} Sends work one way to another bot in a fresh thread they own; nothing there resumes you. Cross-bot only: use start_thread for a separate job on yourself.`,
-    inputSchema: { type: "object", additionalProperties: false, properties: {
-      bot_id: { type: "string", description: "One reachable teammate id from list_bots or list_room_targets." },
-      title: { type: "string", description: "A short one-line title, at most 80 characters." },
-      message: { type: "string", description: "Complete instructions; the recipient does not inherit this conversation." },
-    }, required: ["bot_id", "title", "message"] },
-  },
-  {
-    name: "check_delegation",
-    description: `${DEPRECATED_ALIAS("assignment_status(id)")} Reads one assignment's status without waiting. Results resume you on their own; use this in a later turn only when the person asks.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        task_id: { type: "string", description: "The assignment id a hand-off returned." },
-      },
-      required: ["task_id"],
-    },
-  },
-  {
-    name: "wait_delegation",
-    description: `${DEPRECATED_ALIAS("assignment_status(id, wait_ms)")} Holds for up to timeout_seconds (maximum 240) for one assignment to settle. Only a standing external runtime needs to wait; inside a turn, results resume you on their own.`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        task_id: { type: "string", description: "The assignment id a hand-off returned." },
-        timeout_seconds: { type: "integer", description: "give up waiting after this many seconds; default 60, max 240" },
-      },
-      required: ["task_id"],
-    },
-  },
 ].map((tool) => {
   const annotations = agentToolAnnotations(tool.name);
   return annotations ? { ...tool, annotations } : tool;
@@ -993,7 +956,7 @@ function catalogTools(profile: CatalogProfile) {
     });
   // start_thread opens a job on the bot itself; its schema says so with the
   // one id it accepts. A teammate's fresh thread is coordinate_bots thread
-  // "new" (the peer start_thread of older tool lists is an alias of that).
+  // "new".
   return ROLE_TOOLS.map(tool => tool.name === "start_thread" ? {
     ...tool,
     inputSchema: { ...tool.inputSchema, properties: { ...tool.inputSchema.properties,

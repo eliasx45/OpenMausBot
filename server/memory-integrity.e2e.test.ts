@@ -70,7 +70,7 @@ it("preserves team identity, rejects stale writes, searches shared notes and pin
     writeFileSync(join(folder, "project.aep"), "revision two");
     expect((await api("/api/team-memory?section=Postproduction")).entries.find((entry: TeamMemoryEntry) => entry.id === outcome.id).evidenceStatus).toBe("stale");
     await api(`/api/team-memory/${outcome.id}?section=Postproduction`, "PATCH", { approveEvidence: true, expectedRevision: outcome.revision }, undefined, 409);
-    await api("/api/config", "PUT", { memory: { captureQuietMs: 1_000 } });
+    await api("/api/config", "PUT", { memory: { captureQuietMs: 1_000 }, features: { roomMemoryCapture: true } });
     const { group } = await api("/api/groups", "POST", { name: "Editing decisions", section: "Postproduction", memberIds: [bot.id, helper.id],
       setup: { bulletin: "", defaultResponder: { kind: "member", botId: bot.id } } }, undefined, 201);
     await api(`/api/groups/${group.id}/messages`, "POST", { text: "Use amber for the fixture" }, undefined, 202);

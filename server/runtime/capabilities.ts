@@ -19,7 +19,7 @@ export interface EngineCapabilities {
    * one, Auto would be a rubber stamp (hasNativeAutoReview). */
   nativeReviewer: boolean;
   /** Runs Full access: residual prompts are answered, by the provider or by
-   * the harness's own tool gate for the chat family (supportsApprovalMode). */
+   * the harness (supportsApprovalMode). Every engine does. */
   full: boolean;
   /** Has an auto-accept-edits mode of its own (supportsApprovalMode). */
   edits: boolean;
@@ -56,6 +56,7 @@ const ENGINES: Readonly<Record<string, EngineRow>> = {
   kimiAgent: { resume: true }, // acp/kimi.ts:500 (loadSession:true, :6)
   droidAgent: { resume: true }, // acp/droid.ts:217 (loadSession:true, :5)
   cursorAgent: { resume: true }, // acp/cursor.ts:387
+  museCode: { resume: true }, // muse-code.ts session/resume with the Muse session id
   opencodeGo: { resume: true }, // acp/opencode-go.ts:838
   qwenAgent: { resume: true }, // acp/qwen.ts:219
   hermesAgent: { resume: true }, // acp/hermes.ts:418
@@ -70,13 +71,15 @@ const ENGINES: Readonly<Record<string, EngineRow>> = {
   mistral: { resume: false, stepCap: CHAT_STEP_CAP }, // mistral.ts:48
   cerebras: { resume: false, stepCap: CHAT_STEP_CAP }, // cerebras.ts:41
   groq: { resume: false, stepCap: CHAT_STEP_CAP }, // groq.ts:41
+  meta: { resume: false, stepCap: CHAT_STEP_CAP }, // meta.ts:54
 };
 
 /** The engines with a row, for the table test. */
 export const ENGINE_KINDS: readonly string[] = Object.keys(ENGINES);
 
-/** An unknown or absent engine gets the conservative answer on every flag:
- * no resume, no reviewer, no Full, no Edits, no cap known. */
+/** An unknown or absent engine gets the conservative answer on every flag
+ * but Full, which every engine runs: no resume, no reviewer, no Edits, no
+ * cap known. */
 export function engineCapabilities(driverKind: string | undefined): EngineCapabilities {
   const row = driverKind !== undefined && Object.hasOwn(ENGINES, driverKind) ? ENGINES[driverKind] : undefined;
   return {

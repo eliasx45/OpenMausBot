@@ -10,7 +10,8 @@ import { BUILT_IN_DRIVERS } from "../drivers/builtIn.ts";
 import { ENGINE_KINDS, engineCapabilities, type EngineCapabilities } from "./capabilities.ts";
 
 const chat: EngineCapabilities = { resume: false, nativeReviewer: false, full: true, edits: false, stepCap: 64, subagents: false };
-const bare: EngineCapabilities = { resume: true, nativeReviewer: false, full: false, edits: false, subagents: false };
+// No permissive mode of its own: Full is the harness answering what it leaves.
+const bare: EngineCapabilities = { resume: true, nativeReviewer: false, full: true, edits: false, subagents: false };
 
 const EXPECTED: Record<string, EngineCapabilities> = {
   claudeAgent: { resume: true, nativeReviewer: true, full: true, edits: true, subagents: false },
@@ -22,6 +23,7 @@ const EXPECTED: Record<string, EngineCapabilities> = {
   kimiAgent: bare,
   droidAgent: bare,
   cursorAgent: { resume: true, nativeReviewer: true, full: true, edits: false, subagents: false },
+  museCode: { resume: true, nativeReviewer: false, full: true, edits: false, subagents: false },
   opencodeGo: { resume: true, nativeReviewer: false, full: true, edits: false, subagents: false },
   qwenAgent: { resume: true, nativeReviewer: true, full: true, edits: true, subagents: false },
   hermesAgent: bare,
@@ -33,6 +35,7 @@ const EXPECTED: Record<string, EngineCapabilities> = {
   mistral: chat,
   cerebras: chat,
   groq: chat,
+  meta: chat,
 };
 
 describe("engineCapabilities", () => {
@@ -50,8 +53,8 @@ describe("engineCapabilities", () => {
     expect(engineCapabilities(kind)).toEqual(expected);
   });
 
-  it("answers conservatively for an unknown or absent engine", () => {
-    const none: EngineCapabilities = { resume: false, nativeReviewer: false, full: false, edits: false, subagents: false };
+  it("answers conservatively for an unknown or absent engine, Full aside: every engine runs it", () => {
+    const none: EngineCapabilities = { resume: false, nativeReviewer: false, full: true, edits: false, subagents: false };
     expect(engineCapabilities(undefined)).toEqual(none);
     expect(engineCapabilities("someFutureEngine")).toEqual(none);
     // a prototype name is not an engine

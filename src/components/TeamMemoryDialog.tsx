@@ -10,6 +10,7 @@ import { Brain, Check, Loader2, Pin, Plus, Trash2, X } from "lucide-react";
 import type { ProjectEvidence, EvidenceStatus } from "../../shared/project-evidence";
 
 import { api } from "@/state/store";
+import { t } from "@/lib/i18n";
 import { cn } from "@/lib/cn";
 
 type Kind = "person" | "place" | "decision" | "term" | "lesson" | "question" | "outcome";
@@ -138,7 +139,7 @@ export function TeamMemoryDialog({ section, label, onClose }: { section: string;
   const downloadEvidence = async (entry: Entry, index: number) => {
     try {
       const response = await fetch(`/api/team-memory/${entry.id}/evidence?${query}&artifact=${index}`);
-      if (!response.ok) throw new Error("This evidence changed or is unavailable. Reload before reviewing.");
+      if (!response.ok) throw new Error(t("teamMemory.unavailable"));
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement("a");
       link.href = url;
@@ -191,9 +192,9 @@ export function TeamMemoryDialog({ section, label, onClose }: { section: string;
               <Loader2 size={20} className="animate-spin" aria-label="Loading team memory" />
             </div>
           )}
-          {entries && <p className="mb-3 text-[12px] text-ink-secondary">{loadedIds.length} of {entries.filter(entry => entry.status === "accepted").length} accepted notes load automatically. Other notes remain searchable by the bots. Pin essential rules to load them first.</p>}
-          {error && <div role="alert" className="mb-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">{error} <button onClick={() => void load()} className="underline">Reload latest</button></div>}
-          {unsaved && <p className="mb-3 text-[12px] text-ink-secondary">Your unsaved draft: {unsaved}</p>}
+          {entries && <p className="mb-3 text-[12px] text-ink-secondary">{t("teamMemory.loadedSummary", { loaded: loadedIds.length, total: entries.filter(entry => entry.status === "accepted").length })}</p>}
+          {error && <div role="alert" className="mb-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">{error} <button onClick={() => void load()} className="underline">{t("teamMemory.reload")}</button></div>}
+          {unsaved && <p className="mb-3 text-[12px] text-ink-secondary">{t("teamMemory.unsaved", { text: unsaved })}</p>}
 
           {proposed.length > 0 && (
             <section className="mb-5 rounded-xl border border-accent/30 bg-accent/5 p-3">
@@ -260,16 +261,16 @@ export function TeamMemoryDialog({ section, label, onClose }: { section: string;
                           className="mt-0.5 block w-full rounded bg-transparent px-1 py-0.5 text-[12.5px] text-ink outline-none hover:bg-card focus:bg-card"
                         />
                         <span className="block px-1 text-[11px] text-ink-secondary">
-                          {entry.source.botName || "you"} · {new Date(entry.updatedAt).toLocaleDateString()} · {loadedIds.includes(entry.id) ? "Loaded" : "Searchable"}
+                          {entry.source.botName || "you"} · {new Date(entry.updatedAt).toLocaleDateString()} · {loadedIds.includes(entry.id) ? t("teamMemory.loaded") : t("teamMemory.searchable")}
                         </span>
                         {entry.kind === "outcome" && <div className="mt-1 text-[12px] text-ink-secondary">
-                          <p>Status: {entry.evidenceStatus ?? "unverified"}. Accepting a note does not approve its output.</p>
-                          {entry.evidence && <><p>Saved project: {entry.evidence.project.path} · revision {entry.evidence.project.sha256.slice(0, 12)}</p><p>Artifacts: {entry.evidence.artifacts.map((file, index) => <button key={file.path} className="mr-2 underline" onClick={() => void downloadEvidence(entry, index)}>Download {file.path}</button>)}</p><p>Agent reports: {entry.evidence.check}</p>{entry.evidence.approval && <p>Approved by {entry.evidence.approval.by} on {new Date(entry.evidence.approval.at).toLocaleString()}{entry.evidenceStatus === "stale" ? " — this approval is now stale" : ""}.</p>}<p>Only saved files are tracked; unsaved editor changes are not verified.</p>
-                            {entry.evidenceStatus !== "approved" && <button disabled={busyId !== null || entry.evidenceStatus === "stale"} className="underline disabled:opacity-50" onClick={() => void run(entry.id, () => api(`/api/team-memory/${entry.id}?${query}`, { method: "PATCH", body: JSON.stringify({ approveEvidence: true, expectedRevision: entry.revision }) }))}>Approve this revision</button>}</>}
+                          <p>{t("teamMemory.status", { status: entry.evidenceStatus ?? "unverified" })}</p>
+                          {entry.evidence && <><p>{t("teamMemory.project", { path: entry.evidence.project.path, revision: entry.evidence.project.sha256.slice(0, 12) })}</p><p>{t("teamMemory.artifacts")} {entry.evidence.artifacts.map((file, index) => <button key={file.path} className="mr-2 underline" onClick={() => void downloadEvidence(entry, index)}>{t("teamMemory.download", { path: file.path })}</button>)}</p><p>{t("teamMemory.check", { check: entry.evidence.check })}</p>{entry.evidence.approval && <p>{t("teamMemory.approved", { name: entry.evidence.approval.by, date: new Date(entry.evidence.approval.at).toLocaleString() })}{entry.evidenceStatus === "stale" ? t("teamMemory.staleApproval") : ""}.</p>}<p>{t("teamMemory.savedOnly")}</p>
+                            {entry.evidenceStatus !== "approved" && <button disabled={busyId !== null || entry.evidenceStatus === "stale"} className="underline disabled:opacity-50" onClick={() => void run(entry.id, () => api(`/api/team-memory/${entry.id}?${query}`, { method: "PATCH", body: JSON.stringify({ approveEvidence: true, expectedRevision: entry.revision }) }))}>{t("teamMemory.approve")}</button>}</>}
                         </div>}
-                        {!!entry.history?.length && <details className="mt-1 text-[11px] text-ink-secondary"><summary>Previous versions</summary>{entry.history.map((version, index) => <div key={index} className="mt-1">{new Date(version.at).toLocaleDateString()}: {version.name} — {version.detail} <button disabled={busyId !== null} onClick={() => editDetail(entry, version.detail)} className="underline">Restore text</button></div>)}</details>}
+                        {!!entry.history?.length && <details className="mt-1 text-[11px] text-ink-secondary"><summary>{t("teamMemory.history")}</summary>{entry.history.map((version, index) => <div key={index} className="mt-1">{new Date(version.at).toLocaleDateString()}: {version.name} — {version.detail} <button disabled={busyId !== null} onClick={() => editDetail(entry, version.detail)} className="underline">{t("teamMemory.restore")}</button></div>)}</details>}
                       </span>
-                      <button aria-label={`${entry.pinned ? "Unpin" : "Pin"} ${entry.name}`} aria-pressed={entry.pinned ?? false} disabled={busyId !== null} className="p-1 text-ink-secondary hover:text-accent" onClick={() => void run(entry.id, () => api(`/api/team-memory/${entry.id}?${query}`, { method: "PATCH", body: JSON.stringify({ pinned: !entry.pinned, expectedRevision: entry.revision }) }))}><Pin size={13} /></button>
+                      <button aria-label={t(entry.pinned ? "teamMemory.unpin" : "teamMemory.pin", { name: entry.name })} aria-pressed={entry.pinned ?? false} disabled={busyId !== null} className="p-1 text-ink-secondary hover:text-accent" onClick={() => void run(entry.id, () => api(`/api/team-memory/${entry.id}?${query}`, { method: "PATCH", body: JSON.stringify({ pinned: !entry.pinned, expectedRevision: entry.revision }) }))}><Pin size={13} /></button>
                       <button
                         onClick={() => void remove(entry)}
                         disabled={busyId !== null}
