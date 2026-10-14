@@ -44,6 +44,7 @@ import {
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
 import { runKeepWarmPing, type KeepWarmContract } from "./claude-keepwarm.ts";
+import { BACKGROUND_CALL_TIMEOUT_MS, backgroundCallArgs } from "./claude-background.ts";
 import { permissionCommand, permissionLaunchCwd } from "./permission-command.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { extractMcpImages } from "../mcp-tool-images.ts";
@@ -328,6 +329,7 @@ export const CLAUDE_FLAG_FLOORS = {
   // Keep-warm pings only. Not bisected: both are in every 2.1 build checked.
   "--fork-session": [2, 1, 0],
   "--no-session-persistence": [2, 1, 0],
+  "--tools": [2, 1, 257],
 } as const satisfies Record<string, ClaudeCliVersion>;
 
 const withWhy = (refusal: string, why: string | undefined) => why ? `${refusal} ${why}` : refusal;
@@ -2099,21 +2101,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     };
 
     /** One-shot call, prompt on stdin (approval summaries can hold secrets), no tools or MCP servers. */
-    const generateReview = (prompt: string, signal?: AbortSignal, onUsage?: TextGenerationOptions["onUsage"]): Promise<string> =>
+    const generateReview = (prompt: string, signal?: AbortSignal, onUsage?: TextGenerationOptions["onUsage"], timeoutMs?: number): Promise<string> =>
       new Promise((resolve, reject) => {
         if (config.requireApiKey && !input.environment.ANTHROPIC_API_KEY) {
           reject(new Error(NO_ANTHROPIC_KEY));
           return;
         }
         const model = config.managedModels?.[0] ?? "claude-haiku-4-5";
-        const child = spawnCli(
-          config.cli,
-          ["-p", "--model", model, "--output-format", onUsage ? "json" : "text"],
-          {
-            stdio: ["pipe", "pipe", "pipe"],
-            env: environment(model),
-          },
-        );
+        const env = environment(model);
+        const cwd = mkdtempSync(join(tmpdir(), "omb-claude-background-"));
+        const args = backgroundCallArgs({ model, outputFormat: onUsage ? "json" : "text", supports: (flag) => claudeCliSupports(cliVersion, flag), isolated: !inheritsUserConfig(env) });
+        const child = spawnCli(config.cli, args, { cwd, stdio: ["pipe", "pipe", "pipe"], env });
         let stdout = "";
         let stderr = "";
         let settled = false;
@@ -2122,6 +2120,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           settled = true;
           clearTimeout(timer);
           signal?.removeEventListener("abort", onAbort);
+          rmSync(cwd, { recursive: true, force: true });
           if (error) reject(error);
           else resolve(stdout.trim());
         };
@@ -2132,7 +2131,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         const timer = setTimeout(() => {
           killCliTree(child);
           finish(new Error("Claude review timed out"));
-        }, 60_000);
+        }, timeoutMs ?? BACKGROUND_CALL_TIMEOUT_MS);
         timer.unref?.();
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
@@ -2267,7 +2266,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt, options) => generateReview(prompt, options?.signal, options?.onUsage),
+      generateText: (prompt, options) => generateReview(prompt, options?.signal, options?.onUsage, options?.timeoutMs),
       reviewPermission: generateReview,
       dispose: async () => {
         try {

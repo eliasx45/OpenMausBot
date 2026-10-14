@@ -373,6 +373,8 @@ export interface TextGenerationUsage {
 export interface TextGenerationOptions {
   signal?: AbortSignal;
   onUsage?: (usage: TextGenerationUsage) => void;
+  /** Overrides the driver's background-call timeout. */
+  timeoutMs?: number;
 }
 
 export interface ProviderInstance {
