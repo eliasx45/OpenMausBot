@@ -148,7 +148,8 @@ off. It keeps the notes in shape without the bot having to decide to:
   chat at the next start, so what was said just before quitting is still
   noticed. A crash or a forced kill skips that step (on Windows a `SIGTERM`
   is one), and those turns are not captured. A chat deleted or rewound
-  meanwhile leaves nothing to read.
+  meanwhile leaves nothing to read. Deleting a bot also removes its saved
+  pending captures and upkeep status.
 - **Organizing.** Whoever wrote a line in `MEMORY.md` — the bot with
   `memory_update`, the person, or capture — after each capture and in the
   nightly tidy-up one quick model call looks at lines not judged before and

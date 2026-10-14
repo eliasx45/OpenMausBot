@@ -10271,7 +10271,7 @@ async function deleteBotWithLifecycle(botId: string, revalidate: () => void = ()
           // Re-check the reviewed receipt at the final durable mutation, so a concurrent profile edit cannot be erased under a stale approval.
           revalidate();
           store.deleteBot(bot.id, setupRequest);
-          skillReview.dropBot(bot.id);
+          skillReview.dropBot(bot.id); memoryUpkeep.forgetBot(bot.id);
           routines!.disableForBot(bot.id);
           webhooks.disableForBot(bot.id);
           calendarCalls!.removeBot(bot.id);
