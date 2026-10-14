@@ -14,6 +14,33 @@ export function resultBudget(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_RESULT_BUDGET;
 }
 
+export function serverResultBudget(
+  name: string,
+  perServer: Readonly<Record<string, number>> | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const own = perServer && Object.hasOwn(perServer, name) ? perServer[name] : undefined;
+  if (typeof own === "number" && Number.isFinite(own) && own >= 0) return Math.floor(own);
+  return resultBudget(env);
+}
+
+export function hasOwnResultBudget(name: string, perServer: Readonly<Record<string, number>> | undefined): boolean {
+  const own = perServer && Object.hasOwn(perServer, name) ? perServer[name] : undefined;
+  return typeof own === "number" && Number.isFinite(own) && own >= 1;
+}
+
+export function customServerGate(
+  name: string,
+  owned: boolean,
+  perServer: Readonly<Record<string, number>> | undefined,
+  env?: NodeJS.ProcessEnv,
+): { budget: number; gateRemote: boolean } {
+  return {
+    budget: owned ? serverResultBudget(name, perServer, env) : 0,
+    gateRemote: owned && hasOwnResultBudget(name, perServer),
+  };
+}
+
 export function spillDir(threadId: string): string {
   return join(DATA_DIR, "tool-results", threadId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80) || "thread");
 }
@@ -99,13 +126,16 @@ export function gateServer(input: {
   configEnvName?: string;
   directory?: boolean;
   sourceEnv?: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  /** Gate a URL server even without a selection: the person set a result
+   * limit for this server (hasOwnResultBudget), so it must hold. */
+  gateRemote?: boolean;
 }): { command: string; args: string[]; env: Record<string, string> } | null {
   const { name, server, budget } = input;
   const parsed = parseToolScope(input.toolScope);
   if (!parsed.ok) throw new Error(parsed.error);
   const scoped = parsed.scope !== undefined;
   if (budget <= 0 && !scoped) return null;
-  if (!scoped && remoteMcpSpec(server)) return null;
+  if (!scoped && input.gateRemote !== true && remoteMcpSpec(server)) return null;
   const directory = input.directory === true && remoteMcpSpec(server) !== undefined;
   const spec = mcpStdioServer(server, {
     nodeEnv: input.nodeEnv,

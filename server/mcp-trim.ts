@@ -1,3 +1,4 @@
+
 export const DEFAULT_RESULT_BUDGET = 8_000;
 
 const MIN_BUDGET = 512;
@@ -6,6 +7,10 @@ export interface TrimOutcome {
   text: string;
   trimmed: boolean;
   originalChars: number;
+  /** the parsed payload as kept, when the cut was structural (whole records):
+   * the gate hands it to a `structuredContent` that carried the same data,
+   * so both copies show the same records */
+  value?: unknown;
 }
 
 export interface TrimInput {
@@ -56,25 +61,43 @@ function cutAt(text: string, chars: number): string {
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
 
-function marker(input: {
+/** The warning a trimmed result carries, at the START and again at the END.
+ *
+ * Measured: a quiet trailing note ("layers 5 of 110") let two bots read a
+ * 110-layer composition as five layers, decide the tool was hard-capped, and
+ * report they had checked every layer. So it says, first thing, that the
+ * result is incomplete, how much of it was kept, and what to do about it. */
+export function truncationBanner(input: {
   originalChars: number;
   keptChars: number;
   dropped: Array<{ key: string; kept: number; total: number }>;
   spillPath?: string;
   spillHint?: boolean;
   structural: boolean;
+  /** the short form, for a budget too small to carry the full one twice */
+  short?: boolean;
 }): string {
+  const size = `${fmt(input.keptChars)} of ${fmt(input.originalChars)} chars`;
+  if (input.short) return `⚠️ TRUNCATED by OpenMausBot: kept ${size}; the rest was NOT shown. Narrow the call or page.`;
   const counts = input.dropped
     .filter((d) => d.kept < d.total)
     .map((d) => `${d.key || "items"} ${fmt(d.kept)} of ${fmt(d.total)}`)
     .join(", ");
-  const what = input.structural
-    ? counts ? ` Kept ${counts}.` : ""
-    : " Cut mid-text, so what is above may be incomplete JSON.";
+  const what = input.structural && counts
+    ? `kept ${counts} (${size}).`
+    : input.structural
+      ? `kept ${size}.`
+      : `kept the first ${size}; the text is cut mid-way, so it may be incomplete JSON.`;
+  const next = "If the tool supports paging (offset/limit/page) or a narrower query or filter, call it again for the remaining items; never assume you saw everything.";
   const where = input.spillHint && input.spillPath
     ? ` The whole result is at ${JSON.stringify(input.spillPath)}; reading it costs as much as not trimming, so narrow the call first.`
-    : " If you need more, call the tool again with a narrower query, a filter, or the next page.";
-  return `\n\n[OpenMausBot trimmed this tool result to fit the conversation: ${fmt(input.originalChars)} → ${fmt(input.keptChars)} characters.${what}${where}]`;
+    : "";
+  return `⚠️ TRUNCATED by OpenMausBot: ${what} The rest was NOT shown. ${next}${where}`;
+}
+
+/** The trimmed body with the banner in front and behind it. */
+function wrap(body: string, banner: string): string {
+  return `${banner}\n\n${body}\n\n${banner}`;
 }
 
 export function trimStructured(parsed: unknown, budget: number): { value: unknown; dropped: Array<{ key: string; kept: number; total: number }> } | null {
@@ -113,8 +136,6 @@ export function trimResultText(input: TrimInput): TrimOutcome {
   const budget = Math.max(MIN_BUDGET, input.budget ?? DEFAULT_RESULT_BUDGET);
   if (text.length <= budget) return { text, trimmed: false, originalChars: text.length };
 
-  const room = Math.max(MIN_BUDGET, budget - 400);
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -123,6 +144,17 @@ export function trimResultText(input: TrimInput): TrimOutcome {
   }
 
   const fields = parsed === undefined ? [] : arrayFields(parsed);
+  // Room for the banner at both ends, sized for the longest it can be here
+  // (every count at its widest), so the whole result lands under the budget.
+  // A small budget that the full banners would eat more than half of gets
+  // the short form instead; either way the body has only what is left.
+  const widestOf = (short: boolean) => Math.max(
+    truncationBanner({ originalChars: text.length, keptChars: text.length, dropped: fields.map((f) => ({ key: f.key, kept: Math.max(0, f.items.length - 1), total: f.items.length })), spillPath: input.spillPath, spillHint: input.spillHint, structural: true, short }).length,
+    truncationBanner({ originalChars: text.length, keptChars: text.length, dropped: [], spillPath: input.spillPath, spillHint: input.spillHint, structural: false, short }).length,
+  );
+  const fullRoom = budget - 2 * (widestOf(false) + 2);
+  const short = fullRoom < budget / 2;
+  const room = Math.max(0, short ? budget - 2 * (widestOf(true) + 2) : fullRoom);
   if (fields.length) {
     const skeleton = Array.isArray(parsed)
       ? 2
@@ -147,9 +179,10 @@ export function trimResultText(input: TrimInput): TrimOutcome {
       const json = serialize(value);
       if (json !== null && json.length <= room) {
         return {
-          text: json + marker({ originalChars: text.length, keptChars: json.length, dropped, spillPath: input.spillPath, spillHint: input.spillHint, structural: true }),
+          text: wrap(json, truncationBanner({ originalChars: text.length, keptChars: json.length, dropped, spillPath: input.spillPath, spillHint: input.spillHint, structural: true, short })),
           trimmed: true,
           originalChars: text.length,
+          value,
         };
       }
     }
@@ -157,7 +190,7 @@ export function trimResultText(input: TrimInput): TrimOutcome {
 
   const cut = cutAt(text, room);
   return {
-    text: cut + marker({ originalChars: text.length, keptChars: cut.length, dropped: [], spillPath: input.spillPath, spillHint: input.spillHint, structural: false }),
+    text: wrap(cut, truncationBanner({ originalChars: text.length, keptChars: cut.length, dropped: [], spillPath: input.spillPath, spillHint: input.spillHint, structural: false, short })),
     trimmed: true,
     originalChars: text.length,
   };

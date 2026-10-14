@@ -5,6 +5,9 @@ import type { McpServerSpec, RemoteMcpSpec, StdioMcpSpec } from "./contracts.ts"
 /** One config.json `mcpServers` entry: the block Claude Code, Cursor and Claude Desktop write. */
 export interface StoredStdioMcpServer extends StdioMcpSpec {
   enabled: boolean;
+  /** Characters of one tool result allowed into a model's context; 0 = never
+   * trim. Absent = the app default (OMB_MCP_RESULT_BUDGET, else 8,000). */
+  resultBudget?: number;
 }
 /** An app pre-registered with the server's authorization server; its secret is a credential, never listed. */
 export interface McpOAuthClientConfig {
@@ -15,6 +18,8 @@ export interface McpOAuthClientConfig {
 export interface StoredRemoteMcpServer extends RemoteMcpSpec {
   enabled: boolean;
   oauth?: McpOAuthClientConfig;
+  /** as on StoredStdioMcpServer */
+  resultBudget?: number;
 }
 export type StoredMcpServer = StoredStdioMcpServer | StoredRemoteMcpServer;
 
@@ -25,6 +30,7 @@ export interface StdioMcpServerListing {
   args: string[];
   envKeys: string[];
   enabled: boolean;
+  resultBudget?: number;
 }
 export interface RemoteMcpServerListing {
   name: string;
@@ -32,7 +38,8 @@ export interface RemoteMcpServerListing {
   url: string;
   headerKeys: string[];
   enabled: boolean;
-  oauth?: { clientId: string; scopes: string[]; clientSecretConfigured: boolean };
+  resultBudget?: number;
+    oauth?: { clientId: string; scopes: string[]; clientSecretConfigured: boolean };
 }
 export type McpServerListing = StdioMcpServerListing | RemoteMcpServerListing;
 
@@ -44,6 +51,14 @@ export const MAX_MCP_SERVERS = 20;
 const MAX_ARGS = 64;
 const MAX_ENV = 64;
 const MAX_HEADERS = 32;
+/** The largest per-server result budget: 2,000,000 characters is ~500k
+ * tokens, more than any model's context, so anything above it means "never". */
+export const MAX_RESULT_BUDGET = 2_000_000;
+
+const resultBudgetSchema = z.number({ message: "The result size limit must be a whole number of characters." })
+  .int("The result size limit must be a whole number of characters.")
+  .min(0, "The result size limit cannot be negative.")
+  .max(MAX_RESULT_BUDGET, `The result size limit can be at most ${MAX_RESULT_BUDGET.toLocaleString("en-US")} characters; use 0 for no limit.`);
 const MCP_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** An HTTP header field name: RFC 9110 token characters. */
@@ -99,6 +114,7 @@ const stdioEntrySchema = z.object({
   args: z.array(z.string().max(4_096)).max(MAX_ARGS).optional(),
   env: z.record(z.string(), z.string().max(16_384)).optional(),
   enabled: z.boolean().optional(),
+  resultBudget: resultBudgetSchema.optional(),
 }).strict();
 
 const stdioMutationSchema = stdioEntrySchema.extend({
@@ -124,6 +140,7 @@ const remoteEntrySchema = z.object({
   headers: z.record(z.string(), z.string().max(16_384)).optional(),
   oauth: oauthClientSchema.optional(),
   enabled: z.boolean().optional(),
+  resultBudget: resultBudgetSchema.optional(),
 }).strict();
 
 const remoteMutationSchema = remoteEntrySchema.extend({
@@ -208,6 +225,7 @@ function parseStdio(raw: unknown, mutation: boolean, existing?: StoredMcpServer)
       args: parsed.data.args ?? [],
       env: env.values,
       enabled: enabledFor(parsed.data.enabled, mutation, existing),
+      ...(parsed.data.resultBudget !== undefined ? { resultBudget: parsed.data.resultBudget } : {}),
     },
   };
 }
@@ -237,6 +255,7 @@ function parseRemote(raw: unknown, mutation: boolean, existing?: StoredMcpServer
       headers: headers.values,
       ...(oauth.value ? { oauth: oauth.value } : {}),
       enabled: enabledFor(parsed.data.enabled, mutation, existing),
+      ...(parsed.data.resultBudget !== undefined ? { resultBudget: parsed.data.resultBudget } : {}),
     },
   };
 }
@@ -263,7 +282,7 @@ export function parseMcpServerMutation(
 }
 
 /** Minus `enabled`: a bot may never send that switch. */
-const BOT_MCP_SERVER_KEYS = ["command", "args", "env", "type", "url", "headers", "oauth"] as const;
+const BOT_MCP_SERVER_KEYS = ["command", "args", "env", "type", "url", "headers", "oauth", "resultBudget"] as const;
 
 function pickMcpServerFields(record: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -309,6 +328,7 @@ export function listMcpServers(raw: Record<string, unknown> | undefined): McpSer
         url: server.url,
         headerKeys: Object.keys(server.headers).sort(),
         enabled: server.enabled,
+        ...(server.resultBudget !== undefined ? { resultBudget: server.resultBudget } : {}),
         ...(server.oauth ? {
           oauth: { clientId: server.oauth.clientId, scopes: server.oauth.scopes ?? [], clientSecretConfigured: Boolean(server.oauth.clientSecret) },
         } : {}),
@@ -320,6 +340,7 @@ export function listMcpServers(raw: Record<string, unknown> | undefined): McpSer
       args: server.args,
       envKeys: Object.keys(server.env).sort(),
       enabled: server.enabled,
+      ...(server.resultBudget !== undefined ? { resultBudget: server.resultBudget } : {}),
     }];
   });
 }
@@ -371,8 +392,8 @@ export function parseMcpServersImport(
     if (Object.hasOwn(servers, name)) return { ok: false, error: `"${rawName}" appears twice.` };
     // `enabled` from the paste is dropped so nothing runs before it was tested.
     const result = parseMcpServerMutation(name, looksRemote(record)
-      ? pickEntry(record, ["type", "url", "headers"])
-      : pickEntry(record, ["command", "args", "env"]));
+      ? pickEntry(record, ["type", "url", "headers", "resultBudget"])
+      : pickEntry(record, ["command", "args", "env", "resultBudget"]));
     if (!result.ok) return { ok: false, error: `"${rawName}": ${result.error}` };
     servers[name] = result.server;
   }

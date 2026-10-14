@@ -146,6 +146,12 @@ export interface SendTurnInput {
     dweb?: { url: string };
     /** The user's MCP servers, mounted without any pre-allow; a driver skips a kind it cannot speak. */
     custom?: Record<string, McpServerSpec>;
+    /** Per-server result budget for `custom` (config.json
+     * `mcpServers.<name>.resultBudget`): characters of one tool result
+     * allowed into context, 0 = never trim. A name missing here uses the app
+     * default (mcp-gate-config.ts resultBudget). Kept apart from the specs so
+     * a server mounted as it is never carries a field its engine rejects. */
+    customResultBudgets?: Record<string, number>;
   };
   cwd?: string;
   /** Also load the person's own CLI MCP setup (Claude Code user scope, claude.ai connectors). */
