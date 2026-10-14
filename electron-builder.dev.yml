@@ -10,7 +10,8 @@
 #   are the released app's: credentials.bin stays readable by both;
 # - openmausbotDailyBuild switches the auto-updater off (electron/updater.mjs)
 #   and leaves openmausbot:// links with the released app;
-# - unsigned (ad-hoc), never notarized or published.
+# - signed with an Apple Development certificate (scripts/daily-finish-mac-app.sh,
+#   so Full Disk Access survives rebuilds), never notarized or published.
 extends: ./electron-builder.yml
 appId: com.openmausbot.app.dev
 productName: OpenMausBot Dev
