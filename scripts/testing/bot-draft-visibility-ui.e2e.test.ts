@@ -30,6 +30,7 @@ if (!enabled) console.log("skipping draft visibility UI: set OMB_UI_E2E=1 to ins
     const snapshot = async () => (await ui("snapshot")).snapshot as string;
     const bots = async () => (await fetch(`${info.url}/api/bots?messages=0`).then(response => response.json())).bots as Array<{ id: string; visibility?: string }>;
     const before = await bots();
+    await expect.poll(snapshot, { timeout: 15_000 }).toContain('textbox "Message Pepper"');
     await ui("press", "--keys", "Control+n");
     await expect.poll(snapshot).toContain("Who can see it");
     // The dialog appears before its defaults request completes. Never click
