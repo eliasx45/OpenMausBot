@@ -25,7 +25,7 @@ import { writeFileAtomic, writeFileAtomicIfChanged } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { LEARN_SOURCE_PREFIX } from "./skill-learn.ts";
-import { librarySkillFilePath, listLibrarySkills, type LibrarySkillListing } from "./skill-library.ts";
+import { libraryDescriptionsAt, librarySkillFilePath, listLibrarySkills, type LibrarySkillListing } from "./skill-library.ts";
 import { workspaceDir } from "./workspace.ts";
 import { isSkillName, parseSkillMd, scanSkillText, SKILL_FILE_MAX_BYTES, type ParsedSkill } from "../shared/skill-md.ts";
 import { parseSkillCommand } from "../shared/skill-command.ts";
@@ -782,7 +782,7 @@ function preparedSkillFiles(
   return { files: [{ path: "SKILL.md", content: skillMd.content }], parsed, warnings, skippedFiles };
 }
 
-function preparedLearnedSkill(
+export function preparedLearnedSkill(
   files: Array<{ path: string; content: string }>,
 ): PreparedSkillFiles | { error: string } {
   if (files.length !== 1 || files[0]?.path !== "SKILL.md") {
@@ -1285,11 +1285,7 @@ export function undoSkillWrite(
   return { undone: true };
 }
 
-export function skillsSystemPrompt(botId: string, assignedLibrary?: readonly string[]): string {
-  return composeSkillsSystemPrompt(botId, assignedLibrary);
-}
-
-function composeSkillsSystemPrompt(botId: string, assignedLibrary: readonly string[] | undefined): string {
+export function skillsSystemPrompt(botId: string, assignedLibrary?: readonly string[], startedAt?: number): string {
   syncSkillLinks(botId);
   const enabled = resolveBotSkills(botId, assignedLibrary).filter((skill) => skill.enabled);
   if (!enabled.length) {
@@ -1298,6 +1294,7 @@ function composeSkillsSystemPrompt(botId: string, assignedLibrary: readonly stri
   }
   const root = workspaceDir(botId);
   const manifest = readManifest(botId);
+  const describe = libraryDescriptionsAt(startedAt);
   const lines: string[] = [];
   const intro = "\n\nImported skills:\n";
   const guidance = "Before starting a task one of these covers, read its exact SKILL.md path above with your file tools and follow it. " +
@@ -1311,7 +1308,7 @@ function composeSkillsSystemPrompt(botId: string, assignedLibrary: readonly stri
   for (const skill of enabled.slice(0, INDEX_MAX_SKILLS)) {
     const entry = manifest[skill.name];
     const file = entry ? join(skillTarget(root, skill.name, entry), "SKILL.md") : librarySkillFilePath(skill.name);
-    const line = `- ${skill.name}: ${skill.description} Read ${JSON.stringify(file)}.`;
+    const line = `- ${skill.name}: ${entry ? skill.description : describe(skill.name, skill.description)} Read ${JSON.stringify(file)}.`;
     if (Buffer.byteLength(block([...lines, line], enabled.length - lines.length - 1), "utf8") > INDEX_MAX_BYTES) break;
     lines.push(line);
   }
