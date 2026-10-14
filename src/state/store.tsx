@@ -3667,7 +3667,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const onFocus = () => {
       const now = Date.now();
-      if (now - lastFocusProbe.current < 3000) return;
+      if (now - lastFocusProbe.current < 30_000) return; // every engine's CLI runs; a Keychain prompt refocuses the window
       lastFocusProbe.current = now;
       void refreshInstances();
     };
