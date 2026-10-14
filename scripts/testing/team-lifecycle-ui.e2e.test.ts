@@ -110,7 +110,7 @@ if (!enabled) console.log("skipping team lifecycle UI e2e: set OMB_UI_E2E=1 to i
     await type("Team name", "Delivery");
     await click("Save name");
     await expect.poll(snapshot).toContain('button "Delivery"');
-    await click("Tools");
+    if (await evaluate(`document.querySelector('[data-tour="tools"] button[aria-expanded]')?.getAttribute("aria-expanded") === "false"`)) await click("Tools");
     await click("Team map");
     await manage("Delivery");
     await click("Move bots to Delivery");
@@ -160,7 +160,7 @@ if (!enabled) console.log("skipping team lifecycle UI e2e: set OMB_UI_E2E=1 to i
 
     await ui("eval", "--js", "location.reload(); true");
     await expect.poll(snapshot, { timeout: 15_000 }).toContain('button "Delivery"');
-    await click("Tools");
+    if (await evaluate(`document.querySelector('[data-tour="tools"] button[aria-expanded]')?.getAttribute("aria-expanded") === "false"`)) await click("Tools");
     await click("Team map");
     await manage("Delivery");
     expect(await snapshot()).toContain("Edit Delivery shared instructions");

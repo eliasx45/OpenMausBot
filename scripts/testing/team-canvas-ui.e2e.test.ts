@@ -73,7 +73,7 @@ type BotRecord = {
     })()`);
     const messages = async (id: string) => (await control("messages", "--bot", id, "--limit", "10")).messages;
     const openMap = async () => {
-      await click("Tools");
+      if (await evaluate(`document.querySelector('[data-tour="tools"] button[aria-expanded]')?.getAttribute("aria-expanded") === "false"`)) await click("Tools");
       await click("Team map");
       await expect.poll(() => evaluate("Boolean(document.querySelector('[data-team-canvas]'))"), { timeout: 10_000 }).toBe(true);
     };

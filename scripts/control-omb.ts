@@ -259,6 +259,10 @@ export async function launchVerificationServer(
   writeFileSync(join(dataDir, "config.json"), JSON.stringify({
     ...(boatFixtureApi ? { box: { token: "box_verification_fixture" } } : {}),
     instances: {
+      chatgpt: {
+        driver: "codex", config: { authMode: "chatgpt-plan", cli: extraProviders.includes("codex")
+          ? fileURLToPath(new URL("../server/testing/fake-codex-app-server.ts", import.meta.url)) : join(dataDir, "unavailable-codex") },
+      },
       ...(extraProviders.includes("codex") ? { codex: {
         driver: "codex", displayName: "Verification Codex", config: { cli: fileURLToPath(new URL("../server/testing/fake-codex-app-server.ts", import.meta.url)) },
       } } : {}),
