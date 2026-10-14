@@ -116,7 +116,7 @@ import { connectorCardText } from "./connector-card-text.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { buildRecall } from "./recall.ts";
 import { hostTimeZone, takesTurnClock, turnClockLine, withTurnClock } from "./turn-clock.ts";
-import { createMemoryUpkeep, upkeepEnabled } from "./memory-upkeep.ts";
+import { captureQuietMs, createMemoryUpkeep, tidyHour, upkeepEnabled } from "./memory-upkeep.ts";
 import { createCacheKeepWarm, type KeepWarmStatus, type KeepWarmTarget } from "./cache-keepwarm.ts";
 import { createSkillReview, turnToolSteps } from "./skill-review.ts";
 import type { CaptureTurn, RoomLine } from "./memory-capture.ts";
@@ -167,9 +167,7 @@ import {
   skillReviewEnabled,
   skillReviewSteps,
   autoRecallEnabled,
-  captureQuietMs,
   roomMemoryCaptureEnabled,
-  tidyHour,
   sharedComputersEnabled,
   builtInBrowserEnabled,
   llmThreadTitlesEnabled,
@@ -609,6 +607,8 @@ import { createComputerRoutes } from "./routes/computers.ts";
 import { createStatusRoutes } from "./routes/status.ts";
 import { findAntigravityLeftovers, removeAntigravityLeftovers } from "./drivers/antigravity-temp.ts";
 import { createLiveRoutes } from "./routes/live.ts";
+import { createPhonePushHost } from "./host/phone-push.ts";
+import { routineRunFallbackText } from "./routine-run-text.ts";
 import { createUsageRoutes } from "./routes/usage.ts";
 import { createBotMessageRoutes } from "./routes/bot-messages.ts";
 import { createThreadRoutes } from "./routes/threads.ts";
@@ -1542,7 +1542,9 @@ function bookTurnUsage(row: Omit<UsageRow, "at" | "costSource">, tokensReported 
   const state = spendState(cfg, DATA_DIR);
   const alert = takeSpendAlert(DATA_DIR, state);
   if (alert && state) {
-    broadcast({ kind: "notify", notification: buildSpendNotification({ id: row.botId, name: row.botName }, notificationThreadId, spendAlertText(alert, state)) }, { adminOnly: true });
+    const notification = buildSpendNotification({ id: row.botId, name: row.botName }, notificationThreadId, spendAlertText(alert, state));
+    broadcast({ kind: "notify", notification }, { adminOnly: true });
+    void phonePush.dispatch(notification, { adminOnly: true });
   }
 }
 
@@ -1673,6 +1675,16 @@ const browserCleanup: BrowserCleanupCoordinator = new BrowserCleanupCoordinator(
 });
 const phoneSecrets = new PhoneSecretBridge(postDesktopPrivateMessage);
 const proPlan = new ProPlan({ cloudHome: CLOUD_HOME !== null });
+// Closed-app phone alerts through the hosted relay, its access from the
+// desktop app's message below (server/host/phone-push.ts).
+const phonePush = createPhonePushHost({
+  dataDir: DATA_DIR,
+  cfg: () => cfg,
+  store: () => store,
+  sessions,
+  visibleTo,
+  streams: () => sseClients,
+});
 utilityParentPort?.on("message", (event) => {
   const message = event?.data;
   try {
@@ -1681,6 +1693,7 @@ utilityParentPort?.on("message", (event) => {
     if (browserCleanup.receive(message)) return;
     if (phoneSecrets.receive(message)) return;
     if (proPlan.receive(message)) return;
+    if (phonePush.receive(message)) return;
     composio.applyManagedBrokerMessage(message);
   } catch (error) {
     console.error(`[desktop-sync] rejected private parent message: ${error instanceof Error ? error.message : String(error)}`);
@@ -5401,6 +5414,9 @@ interface SseClient {
   backpressured: boolean;
   viewer: Viewer;
   seen: StreamSeen;
+  /** The phone behind this stream, keyed as its push registration is
+   * (routes/phone-push.ts): while it is open, that phone gets no push. */
+  pushKey?: string;
 }
 const sseClients = new Set<SseClient>();
 
@@ -5728,7 +5744,9 @@ const QUIET_TURN_NEWS: ReadonlySet<Notification["kind"]> = new Set(["done", "tur
 
 function notify(notification: Notification | null) {
   if (notification && QUIET_TURN_NEWS.has(notification.kind) && quietTurnThreads.has(notification.threadId)) return;
-  if (notification) broadcast({ kind: "notify", notification });
+  if (!notification) return;
+  broadcast({ kind: "notify", notification });
+  void phonePush.dispatch(notification);
 }
 
 const roomTurnLevels = createRoomTurnLevels();
@@ -9726,37 +9744,6 @@ function routineRunCard(run: RoutineRun): NonNullable<Message["routineRun"]> {
   return card;
 }
 
-function routineRunFallbackText(card: NonNullable<Message["routineRun"]>): string {
-  const goalState = card.goalStatus === "needs-input"
-    ? "needs your input"
-    : card.goalStatus === "blocked"
-      ? "was blocked"
-      : card.goalStatus === "limit-reached"
-        ? "reached its limit"
-        : card.goalStatus === "stopped"
-          ? "was stopped"
-          : card.goalStatus === "failed"
-            ? "failed"
-            : undefined;
-  const state = goalState ?? (
-    card.status === "waiting"
-      ? "needs your attention"
-      : card.status === "completed"
-        ? "completed"
-        : card.status === "failed"
-          ? "failed"
-          : card.status === "cancelled"
-            ? "was cancelled"
-            : card.status === "missed"
-              ? "was missed"
-              : card.status === "queued" && card.deferredAt != null
-                ? "deferred: target busy"
-              : card.status
-  );
-  const detail = card.summary ?? card.error;
-  return `Routine “${card.routineName}” ${state}${detail ? `\n\n${detail}` : ""}`;
-}
-
 function syncRoutineRunToSource(run: RoutineRun): string | null {
   const source = routineSourceOwner(run);
   if (!source) {
@@ -13608,6 +13595,8 @@ function configStatus() {
       roomMemoryCapture: roomMemoryCaptureEnabled(cfg),
       parallelRoomJobs: parallelRoomJobsEnabled(cfg),
       llmThreadTitles: llmThreadTitlesEnabled(cfg),
+      // closed-app phone alerts through the hosted relay; on unless switched off
+      phonePush: phonePush.enabled(),
     },
     onboarding: {
       completedAt: cfg.onboarding?.completedAt ?? "",
@@ -14361,6 +14350,9 @@ const liveCalls = new LiveCallController({
   log: (line) => console.log(line),
 });
 sessions.onSessionRevoked((sessionId) => liveCalls.sessionRevoked(sessionId));
+// ...and a revoked or expired phone stops getting closed-app alerts.
+sessions.onSessionRevoked((sessionId) => phonePush.forget(`session:${sessionId}`));
+ROUTES.push(phonePush.routes());
 ROUTES.push(createDataRoutes({
   bot: (id) => store.bot(id),
   engine: dataEngine,
@@ -14370,6 +14362,8 @@ ROUTES.push(createDataRoutes({
 }));
 ROUTES.push(createLiveRoutes({
   calls: liveCalls,
+  // the companion's notice that it unpaired a phone also ends its alerts
+  deviceRevoked: (device) => phonePush.forget(`companion:${device}`),
   resolveTarget: (botId, threadId) => {
     const bot = store.bot(botId);
     if (!bot) return null;
@@ -17067,6 +17061,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         },
       };
       if (auth.kind === "session") client.sessionId = auth.session.id;
+      const pushKey = phonePush.streamKey(req, auth);
+      if (pushKey) client.pushKey = pushKey;
       res.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",

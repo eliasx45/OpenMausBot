@@ -272,6 +272,7 @@ const featureConfigSchema = z.object({
   /** Memory upkeep also reads a member bot's room turns. Off unless true. */
   roomMemoryCapture: z.boolean().optional(),
   parallelRoomJobs: z.boolean().optional(), // opt-in: room jobs side by side (server/host/room-jobs.ts)
+  phonePush: z.boolean().optional(),
 });
 const onboardingConfigSchema = z.object({
   completedAt: z.string().trim().max(40).optional(),
@@ -525,7 +526,7 @@ export interface AppConfig {
   context?: { rebuildBytes?: number; compactAt?: number; autoCompact?: boolean; roomCompactAt?: number };
   memory?: { captureQuietMs?: number; tidyHour?: number };
   localVm?: { mode?: "shared" | "per-bot" | "pool"; maxInstances?: number; idleTimeoutMinutes?: number };
-  features?: { skillAuthoring?: boolean; skillReview?: boolean; skillReviewSteps?: number; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean; autoRecall?: boolean; routinesInConversation?: boolean; skillsLibrary?: boolean; shareLearnedSkills?: "off" | "ask" | "auto"; roomMemoryCapture?: boolean; parallelRoomJobs?: boolean };
+  features?: { skillAuthoring?: boolean; skillReview?: boolean; skillReviewSteps?: number; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean; autoRecall?: boolean; routinesInConversation?: boolean; skillsLibrary?: boolean; shareLearnedSkills?: "off" | "ask" | "auto"; roomMemoryCapture?: boolean; parallelRoomJobs?: boolean; phonePush?: boolean };
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[]; firstTurnAt?: string };
   browserProfiles?: BrowserProfile[];
   browserEngine?: { attachCdpUrl?: string; idleTimeoutMinutes?: number };
@@ -707,17 +708,6 @@ export function autoRecallEnabled(cfg: AppConfig): boolean {
 
 export function roomMemoryCaptureEnabled(cfg: AppConfig): boolean {
   return cfg.features?.roomMemoryCapture === true;
-}
-
-export const DEFAULT_CAPTURE_QUIET_MS = 2 * 60_000;
-export const DEFAULT_TIDY_HOUR = 3;
-
-export function captureQuietMs(cfg: AppConfig): number {
-  return cfg.memory?.captureQuietMs ?? DEFAULT_CAPTURE_QUIET_MS;
-}
-
-export function tidyHour(cfg: AppConfig): number {
-  return cfg.memory?.tidyHour ?? DEFAULT_TIDY_HOUR;
 }
 
 export function showToolCallsEnabled(cfg: AppConfig): boolean {

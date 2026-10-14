@@ -18,7 +18,7 @@ import {
   installDesktopCrashListeners,
   readSafeLogTail,
 } from "./diagnostics.mjs";
-import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
+import { CREDENTIAL_PATCH, migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
 import { evictStartupCacheOnce } from "./startup-cache-eviction.mjs";
 import { activateExistingWindow, releaseSingleInstanceLock } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
@@ -87,6 +87,7 @@ import { createManagedDesktopClient, createManagedDesktopRelay, createManagedDes
 import { CHECKOUT_SOURCES, cloudMenuSublabel, cloudPlanSnapshot, createCloudAccountClient, createCloudAccountStore } from "./cloud-account.mjs";
 import { createTrialNotices } from "./cloud-trial-notice.mjs";
 import { createProPlanRelay } from "./pro-plan.mjs";
+import { createPhonePushRelay } from "./phone-push-relay.mjs";
 import { cloudHomeConnectUrl, cloudPlanDisk, isCloudHomeEntry, myCloudOrigin, rememberedCloudHome, savedCloudHomeOrigin, withCloudHome } from "./cloud-home.mjs";
 import { createCloudEntry } from "./cloud-entry.mjs";
 import { cloudPageSenderAllowed, createCloudMove, mintOwnerCode, moveBlocked, moveFit, moveRefusal, moveSenderDestination, parseCloudMoveStatus } from "./cloud-move.mjs";
@@ -337,6 +338,7 @@ const serverSupervisor = createServerSupervisor({
     void readCloudOfferBrand();
     syncManagedComposioCredentials();
     syncProPlan();
+    phonePushRelay.serverStarted();
     orgLibrary?.runtimeReady();
     if (managedDesktop) void managedDesktop.refresh().catch(() => {});
     routineWake.start();
@@ -628,6 +630,8 @@ export async function updateSecureCredentialDocument(derive, afterPersist) {
     return await secureCredentialState.update(derive, afterPersist);
   } finally {
     secureCredentials = secureCredentialState.read();
+    // a hosted sign-in, rotation or sign-out changes what phone push may use
+    phonePushRelay.sync();
   }
 }
 
@@ -1394,6 +1398,12 @@ function syncManagedComposioCredentials() {
   }
 }
 
+const phonePushRelay = createPhonePushRelay({
+  controlPlane: () => resolveCompanionControlPlaneURL({ isPackaged: app.isPackaged, environment: process.env }),
+  credentials: () => secureCredentials,
+  server: () => serverProc,
+  log: slog,
+});
 function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
 }

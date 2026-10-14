@@ -177,7 +177,9 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/live\/call$/ },
   { method: "PATCH", path: /^\/api\/live\/settings$/ },
 
-  // Webhook management stays denied below.
+  { method: "GET", path: /^\/api\/push\/device$/ },
+  { method: "PUT", path: /^\/api\/push\/device$/ },
+  { method: "DELETE", path: /^\/api\/push\/device$/ },
   { method: "GET", path: /^\/api\/routines$/ },
   { method: "POST", path: /^\/api\/routines$/ },
   { method: "PATCH", path: /^\/api\/routines\/[\w-]+$/ },
