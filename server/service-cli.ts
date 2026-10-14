@@ -1,7 +1,12 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
-import { currentUser, launchdPlist, servicePlan, systemdUnit, unstableInstallWarning } from "./service-unit.ts";
+import {
+  currentUser, launchdPlist, sentinelCommand, sentinelLaunchdPlist, sentinelServicePlan, sentinelSystemdService, sentinelSystemdTimer,
+  servicePlan, shippedSentinelCli, systemdUnit, unstableInstallWarning,
+} from "./service-unit.ts";
+import { defaultSentinelOut, outRefusal } from "./sentinel/paths.ts";
 
 export interface ServiceInstallInput {
   action: "install" | "uninstall";
@@ -11,7 +16,12 @@ export interface ServiceInstallInput {
   tunnel?: boolean;
   tailscale?: boolean;
   label?: string;
-  script: string;
+    sentinel?: boolean;
+    sentinelOut?: string;
+  env?: NodeJS.ProcessEnv;
+    exists?: (path: string) => boolean;
+  hasSentinel?: (script: string) => boolean;
+    script: string;
   node: string;
   platform?: NodeJS.Platform;
   home?: string;
@@ -35,6 +45,7 @@ export function serviceServeArgs(input: Pick<ServiceInstallInput, "port" | "data
 export function runServiceCommand(input: ServiceInstallInput, io: ServiceIo): number {
   const platform = input.platform ?? process.platform;
   const home = input.home ?? homedir();
+  if (input.sentinel) return runSentinelService(input, platform, home, io);
   const plan = servicePlan(platform, input.dataDir, home);
   if (!plan) {
     io.error("services are written for Linux (systemd) and macOS (launchd); on Windows, use Task Scheduler to run `openmausbot serve` at startup");
@@ -71,5 +82,79 @@ export function runServiceCommand(input: ServiceInstallInput, io: ServiceIo): nu
   if (input.domain && platform === "linux") io.log("the unit grants Caddy the capability for ports 80 and 443, so no setcap is needed under the service");
   io.log(`logs: ${platform === "darwin" ? `${input.dataDir}/logs/service.log` : "journalctl -u openmausbot -f"}`);
   io.log(`change options later by running \`openmausbot service install\` again with the new ones, then: ${platform === "darwin" ? plan.activate[1] : "sudo systemctl daemon-reload && sudo systemctl restart openmausbot"}`);
+  return 0;
+}
+
+/** An app released before Sentinel bundles a CLI without it; its usage text
+ * names --check-install from the first release that has it. */
+function bundleHasSentinel(script: string): boolean {
+  try {
+    return readFileSync(script, "utf8").includes("--check-install");
+  } catch {
+    return false;
+  }
+}
+
+function runSentinelService(input: ServiceInstallInput, platform: NodeJS.Platform, home: string, io: ServiceIo): number {
+  const out = input.sentinelOut ?? defaultSentinelOut(input.dataDir, platform, home, input.env ?? process.env);
+  const plan = sentinelServicePlan(platform, out, home);
+  if (!plan) {
+    // printed for the person to run, never executed: /TR takes the whole
+    // command line as one argument, with its own quotes escaped
+    const command = sentinelCommand({ ...input, out }).map((arg) => `\\"${arg}\\"`).join(" ");
+    io.error("services are written for Linux (systemd) and macOS (launchd); on Windows, use Task Scheduler to run Sentinel every two minutes:");
+    io.error(`  schtasks /Create /SC MINUTE /MO 2 /TN "OpenMausBot Sentinel" /TR "${command}"`);
+    return 1;
+  }
+  if (input.action === "uninstall") {
+    io.log("to stop and remove the Sentinel schedule:");
+    for (const line of plan.deactivate) io.log(`  ${line}`);
+    return 0;
+  }
+  // the scan would refuse this folder on every run (XDG_STATE_HOME inside
+  // the data dir, a link into a repository); say so now, before writing
+  const refusal = outRefusal(out, input.dataDir);
+  if (refusal) {
+    io.error(refusal);
+    return 1;
+  }
+  // the installed app's own CLI survives app updates and Node upgrades;
+  // this process's node and script may be a checkout or an nvm install
+  const shipped = shippedSentinelCli(platform, home, input.exists ?? existsSync, input.hasSentinel ?? bundleHasSentinel);
+  if (!shipped) {
+    const warning = unstableInstallWarning(input.script);
+    if (warning) {
+      io.error(warning);
+      return 1;
+    }
+  }
+  const spec = shipped
+    ? { ...shipped, electronRunAsNode: true, dataDir: input.dataDir, home, out }
+    : { node: input.node, script: input.script, dataDir: input.dataDir, home, out };
+  io.log(shipped ? `runs the desktop app's own CLI: ${shipped.script}` : `runs ${input.script} with ${input.node}; if either moves (a new checkout, a Node upgrade), run this again`);
+  let rendered: Record<string, string>;
+  try {
+    rendered = platform === "darwin"
+      ? { [plan.files[0]!.name]: sentinelLaunchdPlist(spec) }
+      : { [plan.files[0]!.name]: sentinelSystemdService(spec), [plan.files[1]!.name]: sentinelSystemdTimer() };
+  } catch (error) {
+    // a path no service file can hold: nothing is written
+    io.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+  // Sentinel's folder, outside the data dir; launchd opens the log in it
+  // itself and will not create the folder
+  mkdirSync(out, { recursive: true, mode: 0o700 });
+  for (const file of plan.files) {
+    writeFileSync(join(out, file.name), rendered[file.name]!, { mode: 0o644 });
+    io.log(`wrote ${join(out, file.name)}`);
+  }
+  io.log("");
+  io.log("to install it (a read-only health scan every two minutes, at login and after):");
+  for (const line of plan.activate) io.log(`  ${line}`);
+  io.log("");
+  io.log(`issues: ${join(out, "issues.jsonl")}`);
+  io.log(`logs: ${platform === "darwin" ? join(out, "sentinel.log") : "journalctl --user -u openmausbot-sentinel"}`);
+  io.log("after an app update or a Node upgrade, check the schedule still points at both: openmausbot sentinel --check-install");
   return 0;
 }
