@@ -5944,7 +5944,7 @@ function captureRoomTurnFor(threadId: string, botId: string, turnId: string, fai
   const path = store.activePath(threadId);
   const replyAt = path.findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.turnId === turnId && message.from?.botId === botId);
   if (replyAt < 0) return null;
-  const lastSpoke = path.slice(0, replyAt).findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.from?.botId === botId);
+  const lastSpoke = path.slice(0, replyAt).findLastIndex((message) => message.role === "bot" && message.kind === "text" && message.from?.botId === botId && message.turnId !== turnId);
   const lines: RoomLine[] = [];
   for (const message of path.slice(lastSpoke + 1, replyAt)) {
     if (message.kind !== "text" || !message.text?.trim()) continue;

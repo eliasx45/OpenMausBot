@@ -23,6 +23,25 @@ it("never labels a delegated ask as the owner's words or accepts a missing reply
   expect(memoryTurn(path, "b", "abandoned-turn", false)).toBeNull();
 });
 
+it("keeps the request and mid-turn correction across the bot's own progress updates", () => {
+  const from = { botId: "b", name: "Editor", color: "blue" };
+  const turn = memoryTurn([
+    message("old-request", "user", "Use blue"),
+    message("old-reply", "bot", "Previous work", { turnId: "previous-turn", from }),
+    message("request", "user", "Use After Effects"),
+    message("progress", "bot", "I am checking the project", { turnId: "turn", from }),
+    message("correction", "user", "The master is orange.aep"),
+    message("progress-2", "bot", "I am checking that file", { turnId: "turn", from }),
+    message("reply", "bot", "The file is ready", { turnId: "turn", from }),
+  ], "b", "turn", true);
+  expect(turn?.room?.map(line => [line.messageId, line.text])).toEqual([
+    ["request", "Use After Effects"],
+    ["correction", "The master is orange.aep"],
+  ]);
+  expect(turn?.sourceMessageId).toBe("reply");
+  expect(turn?.personMessageId).toBe("correction");
+});
+
 
 it("captures a fresh delegated bot-only thread without inventing an owner request", () => {
   const reply = message("reply", "bot", "Saved the project", { turnId: "turn" });

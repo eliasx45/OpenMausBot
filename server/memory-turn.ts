@@ -10,12 +10,12 @@ export function memoryTurn(messages: readonly Message[], botId: string, turnId: 
   if (replyAt < 0) return null;
   const reply = messages[replyAt];
   const clean = (text: string) => redactSecretsInText(extractTurnImages(text).text);
-  const previous = room ? messages.slice(0, replyAt).findLastIndex(message => message.role === "bot" && message.kind === "text" && message.from?.botId === botId) : -1;
+  const previous = room ? messages.slice(0, replyAt).findLastIndex(message => message.role === "bot" && message.kind === "text" && message.from?.botId === botId && message.turnId !== turnId) : -1;
   const before = messages.slice(previous + 1, replyAt);
   const asked = before.findLast(message => message.role === "user" && message.kind === "text");
   if (!room && !asked && !delegated) return null;
   delegated ||= Boolean(asked?.peerAsk);
-  const lines: RoomLine[] = before.filter(message => message.kind === "text" && !message.peerAsk && (message.role === "user" || message.role === "bot"))
+  const lines: RoomLine[] = before.filter(message => message.kind === "text" && !message.peerAsk && (message.role === "user" || (message.role === "bot" && message.from?.botId !== botId)))
     .slice(-30).map(message => ({ by: message.role === "bot" ? "peer" : message.sender || message.relayed ? "other" : "person",
       name: message.from?.name ?? "participant", text: clean(message.text ?? ""), messageId: message.id }));
   const tools = messages.filter(message => message.turnId === turnId && message.kind === "activity" && message.tool)
