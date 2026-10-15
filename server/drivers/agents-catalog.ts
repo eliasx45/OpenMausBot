@@ -15,6 +15,8 @@ export interface CatalogProfile {
   chief: boolean;
   /** Written into start_thread's schema: the only bot_id it accepts. */
   botId: string;
+  /** features.chiefEscalations: raise_escalation is mounted. */
+  escalations?: boolean;
 }
 
 /** Everything is off unless the harness says "1". */
@@ -27,6 +29,7 @@ export function catalogProfileFromEnv(env: NodeJS.ProcessEnv): CatalogProfile {
     memoryEnabled: env.OMB_MEMORY_ENABLED !== "0",
     chief: env.OMB_CHIEF_OF_STAFF === "1",
     botId: env.OMB_BOT_ID ?? "",
+    escalations: env.OMB_ESCALATIONS === "1",
   };
 }
 
@@ -223,7 +226,7 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "coordinate_bots",
-    description: "The one way to hand work on: ask existing OpenMausBot teammates a question or assign them concrete work. In a room it defaults to this room; use group_id from list_room_targets for a specific room. Outside a room, everything you send a teammate from this conversation goes to one standing work thread with them and runs after anything still running there; thread \"new\" opens a fresh thread on them instead. Give 1-4 bot_ids — teammate ids as list_bots or your roster prints them; a unique teammate name also resolves: they see only what you send them and use their own model, tools and permissions. They can consult their own specialists; every result returns here and resumes you automatically, so after sending all assignments END your turn: do not poll or wait, and never call assignment_status in the same turn. consult true asks a question the teammate answers from what it knows, acting on nothing; reply \"none\" is a one-way notice nothing comes back from. Include exact file paths, constraints and what must be verified (done_when). On return, resolve tradeoffs, verify the requested outcome and request concrete corrections with rework true if necessary before giving one final answer. Never target whoever assigned you this work or anyone above it: to ask them something or report back, end your turn with it — they are resumed with your reply. Never send thanks, approval or acknowledgements to a teammate whose request finished: its result already returned here. If a call is refused, do not retry it: change what you send or say in your reply what you wanted.",
+    description: "The one way to hand work on: ask existing OpenMausBot teammates a question or assign them concrete work. In a room it defaults to this room; use group_id from list_room_targets for a specific room. Outside a room, everything you send a teammate from this conversation goes to one standing work thread with them and runs after anything still running there; thread \"new\" opens a fresh thread on them instead. Give 1-4 bot_ids — teammate ids as list_bots or your roster prints them; a unique teammate name also resolves: they see only what you send them and use their own model, tools and permissions. They can consult their own specialists; every result returns here and resumes you automatically, so after sending all assignments END your turn: do not poll or wait, and never call assignment_status in the same turn. consult true asks a question the teammate answers from what it knows, acting on nothing; reply \"none\" is a one-way notice nothing comes back from. Include exact file paths, constraints and what must be verified (done_when). On return, resolve tradeoffs, verify the requested outcome and request concrete corrections with rework true if necessary before giving one final answer. Never target whoever assigned you this work or anyone above it: to ask or report back, end your turn and your reply resumes them. Never thank or approve a finished teammate; its result already returned. Never repeat a refused call unchanged.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
       group_id: { type: "string", description: "Optional destination room; omit for this room or, outside a room, your thread with each teammate." },
       bot_ids: { type: "array", items: { type: "string", description: "A teammate's id exactly as list_bots or your roster prints it ([id: …]). A teammate's unique display name also resolves; a name shared by two reachable teammates is refused." }, minItems: 1, maxItems: 4, uniqueItems: true },
@@ -243,6 +246,13 @@ const TOOL_DEFINITIONS = [
       id: { type: "string", description: "The assignment id (a coordinate_bots receipt's requestId, or a delegation id from list_threads). Omit to list every outstanding assignment of this conversation." },
       wait_ms: { type: "integer", minimum: 0, maximum: 240_000, description: "Only for a standing external runtime: hold the answer up to this many milliseconds (at most 240000) for the assignment to settle. Omit inside a turn." },
     } },
+  },
+  {
+    name: "raise_escalation",
+    description: "Flag a gate only the person can lift — a permission or decision your work is parked on and you cannot proceed without. One reason line, the person's own words where possible; the Chief of Staff (or the person directly) is told at once. Then end your turn and wait: the gate lifting resumes nothing on its own, so say plainly that you stopped and why. Not for failures (those report themselves), not for a credential or sign-in (use request_credential or request_sign_in, which resume you), and not to ask the person a question you could ask by ending your turn on it.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {
+      reason: { type: "string", minLength: 1, maxLength: 500, description: "One line: what you need from the person and why your work is parked on it." },
+    }, required: ["reason"] },
   },
   {
     name: "list_bots",
@@ -268,7 +278,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "list_threads",
     description:
-      "See your own threads and the threads you opened on teammates, newest first: each with its bot, title, state (running, waiting on the person, queued, idle, or closed), whether the person has unread there, and the delegation id if it was a handoff. Use it to check how the threads you started are going before reporting to the person; write a thread's title as #Title when you mention it. A teammate's other threads are never listed — only the ones you opened. This is a read: it starts nothing and changes nothing.",
+      "See your own threads and the threads you opened on teammates, newest first: each with its bot, title, state (running, waiting on the person, queued, idle, or closed), whether the person has unread there, and the delegation id if it was a handoff. Use it to check how the threads you started are going before reporting to the person; write a thread's title as #Title when you mention it. A Chief of Staff also sees threads teammates opened on each other. This is a read: it starts nothing and changes nothing.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
@@ -772,12 +782,12 @@ const TOOL_DEFINITIONS = [
           type: "array",
           maxItems: 8,
           description:
-            "Optional detail files kept inside the skill, each at most 32KB like SKILL.md. Use them when SKILL.md would pass 32KB: keep the core steps in SKILL.md, move long rule lists or examples here, and link each file from SKILL.md (for example \"For edge cases, read references/edge-cases.md.\"). On update, references you leave out stay as they are; empty content removes one.",
+            "Optional detail files (32KB each) for when SKILL.md would pass 32KB: keep the core steps in SKILL.md, move long rules or examples here, and link each from SKILL.md. On update, omitted references stay; empty content removes one.",
           items: {
             type: "object",
             additionalProperties: false,
             properties: {
-              path: { type: "string", description: "references/<topic>.md, with lowercase letters, digits, and hyphens in <topic>." },
+              path: { type: "string", description: "references/<topic>.md; <topic> uses lowercase letters, digits, and hyphens." },
               content: { type: "string", description: "The full Markdown file; empty removes it on update." },
             },
             required: ["path", "content"],
@@ -899,7 +909,8 @@ export function availableTools(profile: CatalogProfile) {
 function catalogTools(profile: CatalogProfile) {
   const BOT_SCOPED_TOOLS = TOOL_DEFINITIONS.filter((tool) =>
     (profile.botId === WATCHER_OPTIONS_CARD_BOT_ID || !WATCHER_TOOL_NAMES.has(tool.name)) &&
-    (profile.memoryEnabled !== false || (tool.name !== "memory_update" && tool.name !== "memory_log")));
+    (profile.memoryEnabled !== false || (tool.name !== "memory_update" && tool.name !== "memory_log")) &&
+    (profile.escalations === true || tool.name !== "raise_escalation"));
   const AUTHORING_TOOLS = profile.skillAuthoring
     ? BOT_SCOPED_TOOLS
     : BOT_SCOPED_TOOLS.filter((tool) => !SKILL_TOOL_NAMES.has(tool.name));

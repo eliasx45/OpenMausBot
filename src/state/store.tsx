@@ -9,8 +9,14 @@ import {
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
-import type { BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, InstalledPackageMetadata, LiveCallState, ServerFrame, GroupThreadUsage, SteerQueueReason, WireGroup } from "../../shared/wire";
+import type { BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, InstalledPackageMetadata, LiveCallState, ServerFrame, GroupThreadUsage, SteerQueueReason, WireGroup, OptionCardData as WireOptionCard } from "../../shared/wire";
+import { movesThreadToTop } from "../../shared/wire";
 import { DATA_ROUTES, type DataSheet, type DataTable } from "../../shared/data-surface";
+import type { NotificationLogEntry } from "../../shared/notification";
+import { reduceNotificationFeed, type NotificationFeedAction } from "./notification-feed";
+import { bumpThreadUpdatedAt, mergeTaskStamps, rewindThreadUpdatedAt } from "./thread-stamps";
+import { botOpensTo, openBot, openNotificationTarget, visibleNotificationThread } from "./thread-navigation";
+export { awayFromMainThread, botOpensTo, openBot, openBotThread, openNotificationTarget, openThread, visibleNotificationThread, type ThreadTarget } from "./thread-navigation";
 import type { TurnDigest } from "../../shared/digest";
 import type { ToolScope } from "../../shared/tool-scope";
 import type { ModelVariantOption, RuntimeEvent } from "../../shared/runtime-events";
@@ -34,6 +40,7 @@ import {
 } from "../../shared/skill-request";
 import type { Routine, RoutineInput, RoutineRun, RoutineRunStatusFilter } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
+import { restrictedCopyRequest } from "@/lib/bot-duplicate";
 import { botShowsUnread } from "@/lib/bot-unread";
 import { firstUnreadMessageId, threadOpensUnread, threadReadCursor } from "@/lib/unread-divider";
 import type { ComputerStart } from "@/lib/computer-start";
@@ -42,7 +49,7 @@ import { answerResponse, dismissResponse } from "@/lib/card-answer";
 import { currentCall } from "@/lib/call";
 import { readLastConversation, rememberConversation } from "@/lib/last-conversation";
 import { readLastBotSection, rememberBotSection } from "@/lib/last-bot-section";
-import { showNotification, type NotificationTarget } from "@/lib/notify";
+import { showNotification } from "@/lib/notify";
 import { useShowThreads } from "@/lib/thread-preferences";
 import { speaker } from "@/lib/tts";
 import { roleProfilePatch, type BotRole } from "@/lib/bot-roles";
@@ -73,7 +80,7 @@ function trimRoutineRuns(runs: readonly RoutineRun[]): RoutineRun[] {
 export type { MausColor } from "@/lib/mascot";
 export type { RoutineRunCardData } from "../../shared/routine-run";
 
-export interface OptionCardData {
+export interface OptionCardData extends Pick<WireOptionCard, "fixedOptions"> {
   title: string;
   subtitle: string;
   options: string[];
@@ -135,7 +142,7 @@ export interface SecretRequestCardData {
 
 export type ComputerControlState = { held: boolean; helpReason: string | null; help?: import("../../shared/wire").ComputerHelpRef | null };
 
-export interface Message extends Pick<import("../../shared/wire").WireMessage, "widget"> {
+export interface Message extends Pick<import("../../shared/wire").WireMessage, "widget" | "routedBy" | "quickModel"> {
   id: string;
   role: "bot" | "user";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "signin" | "routine.run" | "goal.run" | "digest" | "compaction" | "call" | "widget";
@@ -158,6 +165,8 @@ export interface Message extends Pick<import("../../shared/wire").WireMessage, "
   requestMessageId?: string;
   turnId?: string;
   turnTerminal?: boolean;
+  turnCompletedAt?: number;
+  optimisticThreadOrderAt?: number;
   hasImage?: boolean;
   png?: string;
   mime?: string;
@@ -174,7 +183,6 @@ export interface Message extends Pick<import("../../shared/wire").WireMessage, "
   dataResult?: import("../../shared/wire").WireMessage["dataResult"];
   queued?: boolean;
   queueId?: string;
-  routedBy?: import("../../shared/wire").WireMessage["routedBy"];
 }
 
 export type GroupDefaultResponder = import("../../shared/wire").GroupDefaultResponder;
@@ -217,6 +225,7 @@ export interface GroupTask {
   pinned?: boolean;
   updatedAt?: number;
   turnTimeoutMinutes?: number;
+  lastThreadOrderAt?: number;
   working?: boolean;
   busyBotId?: string | null;
 }
@@ -238,6 +247,7 @@ export interface Task {
   pinned?: boolean;
   link?: string;
   updatedAt?: number;
+  lastThreadOrderAt?: number;
   usage?: TaskUsage;
   cacheKeepWarm?: import("../../shared/wire").CacheKeepWarmStatus;
   cwd?: string | null;
@@ -318,6 +328,7 @@ export interface Bot {
   approvalMode?: ApprovalMode;
   alwaysAllow?: string[];
   speakReplies?: boolean;
+  replyStyle?: import("../../shared/wire").WireBot["replyStyle"];
   voice?: string;
   voiceNotes?: boolean;
   memoryEnabled?: boolean;
@@ -338,6 +349,7 @@ export interface Bot {
   recordBrowserSteps?: boolean;
   memoryUpkeep?: boolean;
   cacheKeepWarm?: boolean | null;
+  helperModel?: boolean;
   mcpServers?: string[] | null;
   browserProfile?: string | null;
   visibility?: BotVisibility;
@@ -405,48 +417,6 @@ function taskPatchFields(patch: TaskUpdatePatch): Partial<Task> {
     ...(surface === undefined ? {} : { surface: surface ?? undefined, surfaceAuto: undefined }),
     ...(pinned === undefined ? {} : { pinned: pinned ? true : undefined }),
     ...(link === undefined ? {} : { link: link ?? undefined }) };
-}
-
-function mergeTaskStamps<T extends { threadId: string; updatedAt?: number }>(previous: T[] | undefined, incoming: T[] | undefined): T[] | undefined {
-  if (!incoming) return previous;
-  const prior = new Map((previous ?? []).map((task) => [task.threadId, task.updatedAt]));
-  return incoming.map((task) => {
-    const local = prior.get(task.threadId);
-    if (typeof local !== "number") return task;
-    const remote = task.updatedAt;
-    const updatedAt = typeof remote === "number" ? Math.max(local, remote) : local;
-    return updatedAt === task.updatedAt ? task : { ...task, updatedAt };
-  });
-}
-
-function bumpThreadUpdatedAt(state: AppState, threadId: string, at: number): AppState {
-  if (!Number.isFinite(at)) return state;
-  const advance = <T extends { threadId: string; updatedAt?: number }>(tasks: T[] | undefined) =>
-    tasks?.some((task) => task.threadId === threadId)
-      ? tasks.map((task) => task.threadId === threadId ? { ...task, updatedAt: Math.max(task.updatedAt ?? 0, at) } : task)
-      : tasks;
-  return {
-    ...state,
-    bots: state.bots.map((bot) => {
-      const tasks = advance(bot.tasks);
-      return tasks === bot.tasks ? bot : { ...bot, tasks };
-    }),
-    groups: state.groups.map((group) => {
-      const tasks = advance(group.tasks);
-      return tasks === group.tasks ? group : { ...group, tasks };
-    }),
-  };
-}
-
-function rewindThreadUpdatedAt(state: AppState, threadId: string, messages: { at: number }[], createdAt: number): AppState {
-  const at = messages.reduce((max, message) => Math.max(max, message.at || 0), createdAt);
-  const apply = <T extends { threadId: string; updatedAt?: number }>(tasks: T[] | undefined) =>
-    tasks?.map((task) => task.threadId === threadId ? { ...task, updatedAt: at } : task);
-  return {
-    ...state,
-    bots: state.bots.map((bot) => bot.tasks?.some((task) => task.threadId === threadId) ? { ...bot, tasks: apply(bot.tasks) } : bot),
-    groups: state.groups.map((group) => group.tasks?.some((task) => task.threadId === threadId) ? { ...group, tasks: apply(group.tasks) } : group),
-  };
 }
 
 function openedUnreadDivider(state: AppState, threadId: string, unread: boolean, messages: readonly Message[], lastReadMessageId?: string): AppState["unreadDivider"] {
@@ -638,7 +608,9 @@ export interface AppState {
   liveCallVersion: number;
   liveCallLookupSeq: number;
   selectedId: string;
-  activeView: "chat" | "team-map" | "routines";
+  activeView: "chat" | "team-map" | "routines" | "files";
+  /** Folders a finished move left on this computer, for Files to offer sharing. */
+  filesSuggest: string[] | null;
   routines: Routine[];
   routineRuns: RoutineRun[];
   routinesLoadState: "loading" | "ready" | "error";
@@ -655,6 +627,10 @@ export interface AppState {
   computerOpen: boolean;
   inspectorOpen: boolean;
   activityOpen: boolean;
+  /** Cross-bot, so a bot switch leaves it open; pinned, opening another side panel leaves it open too. */
+  notificationsOpen: boolean;
+  notificationsPinned: boolean;
+  notifications: NotificationLogEntry[];
   appSettingsOpen: boolean;
   appSettingsSection: AppSettingsSection;
   appSettingsCloudLink: number;
@@ -777,12 +753,16 @@ export type Action =
   | { type: "sectionDeleted"; section: string; sections: string[] }
   | { type: "showRoutines"; section?: "schedule" | "logs"; view?: "calendar" | "list"; botId?: string; routineId?: string; runStatus?: RoutineRunStatusFilter }
   | { type: "showTeamMap" }
+  | { type: "showFiles"; suggest?: string[] }
   | { type: "showChat" }
   | { type: "routinesHydrated"; routines: Routine[]; runs: RoutineRun[] }
   | { type: "routinesLoadFailed" }
   | { type: "routinePatched"; routine: Routine }
   | { type: "routineDeleted"; routineId: string }
   | { type: "routineRunPatched"; run: RoutineRun }
+  | NotificationFeedAction
+  | { type: "toggleNotifications"; open?: boolean }
+  | { type: "toggleNotificationsPinned"; pinned?: boolean }
   | { type: "webhooksHydrated"; webhooks: WebhookTrigger[]; attempts: WebhookAttempt[]; ingress: WebhookIngressStatus }
   | { type: "webhookPatched"; webhook: WebhookTrigger }
   | { type: "webhookAttempted"; attempt: WebhookAttempt }
@@ -946,120 +926,6 @@ export function pinBotThreadAction(action: Action, bots: Bot[]): Action {
   return { ...action, threadId } as Action;
 }
 
-interface NotificationThreadOwner {
-  id: string;
-  threadId: string;
-  mainThreadId?: string;
-  tasks?: Array<{ threadId: string }>;
-}
-
-interface NotificationRoutingState {
-  bots: NotificationThreadOwner[];
-  groups: NotificationThreadOwner[];
-}
-
-export function visibleNotificationThread(
-  state: NotificationRoutingState & Pick<AppState, "activeView" | "selectedId">,
-): string | null {
-  if (state.activeView !== "chat") return null;
-  return (
-    state.bots.find((candidate) => candidate.id === state.selectedId)?.threadId ??
-    state.groups.find((candidate) => candidate.id === state.selectedId)?.threadId ??
-    null
-  );
-}
-
-export function openNotificationTarget(
-  dispatch: (action: Action) => void,
-  target: NotificationTarget,
-  state: NotificationRoutingState,
-  threadsShown: boolean,
-) {
-  // A room notification carries the asker bot with the room's thread id; switching the bot to it would 404.
-  const group = state.groups.find(
-    (candidate) =>
-      candidate.threadId === target.threadId ||
-      (candidate.tasks ?? []).some((task) => task.threadId === target.threadId),
-  );
-  if (group) {
-    dispatch({ type: "select", id: group.id });
-    if (group.threadId !== target.threadId) {
-      dispatch({ type: "switchGroupTask", groupId: group.id, threadId: target.threadId });
-    }
-    return;
-  }
-  const bot = state.bots.find((candidate) =>
-    candidate.threadId === target.threadId || candidate.tasks?.some((task) => task.threadId === target.threadId)
-  ) ?? state.bots.find((candidate) => candidate.id === target.botId);
-  if (!bot) {
-    dispatch({ type: "select", id: target.botId });
-    return;
-  }
-  const known =
-    bot.threadId === target.threadId ||
-    (bot.tasks ?? []).some((task) => task.threadId === target.threadId);
-  if (known) openBotThread(dispatch, bot, target.threadId, threadsShown);
-  else openBot(dispatch, bot, threadsShown);
-}
-
-export function botOpensTo(bot: Pick<NotificationThreadOwner, "threadId" | "mainThreadId" | "tasks">, threadsShown: boolean): string {
-  return !threadsShown && bot.mainThreadId && bot.tasks?.some((task) => task.threadId === bot.mainThreadId)
-    ? bot.mainThreadId : bot.threadId;
-}
-
-export function awayFromMainThread(bot: Pick<NotificationThreadOwner, "threadId" | "mainThreadId" | "tasks">, threadsShown: boolean): boolean {
-  return !threadsShown && botOpensTo(bot, false) !== bot.threadId;
-}
-
-export function openBot(
-  dispatch: (action: Action) => void,
-  bot: Pick<NotificationThreadOwner, "id" | "threadId" | "mainThreadId" | "tasks">,
-  threadsShown: boolean,
-) {
-  const opened = botOpensTo(bot, threadsShown);
-  if (opened === bot.threadId) dispatch({ type: "select", id: bot.id });
-  else openBotThread(dispatch, bot, opened, threadsShown);
-}
-
-/** With threads hidden the switch alone selects the bot, so the thread left behind keeps its unread mark. */
-export function openBotThread(
-  dispatch: (action: Action) => void,
-  bot: Pick<NotificationThreadOwner, "id" | "threadId">,
-  threadId: string,
-  threadsShown: boolean,
-) {
-  if (threadsShown || threadId === bot.threadId) dispatch({ type: "select", id: bot.id });
-  dispatch({ type: "switchTask", botId: bot.id, threadId });
-}
-
-export interface ThreadTarget {
-  botId: string;
-  threadId: string;
-}
-
-interface ThreadOpeningState extends NotificationRoutingState {
-  bots: Array<NotificationThreadOwner & { name: string }>;
-}
-
-export function openThread(
-  dispatch: (action: Action) => void,
-  target: ThreadTarget,
-  state: ThreadOpeningState,
-  threadsShown: boolean,
-): boolean {
-  const owns = (owner: NotificationThreadOwner) =>
-    owner.threadId === target.threadId || (owner.tasks ?? []).some((task) => task.threadId === target.threadId);
-  if (state.groups.some(owns) || state.bots.some(owns)) {
-    openNotificationTarget(dispatch, target, state, threadsShown);
-    dispatch({ type: "revealThread", threadId: target.threadId });
-    return true;
-  }
-  const bot = state.bots.find((candidate) => candidate.id === target.botId);
-  if (bot) openBot(dispatch, bot, threadsShown);
-  dispatch({ type: "notice", notice: { kind: "thread-gone", botName: bot?.name ?? null } });
-  return false;
-}
-
 function bumpTranscriptGeneration(state: AppState, threadId: string | undefined | null): AppState {
   if (!threadId) return state;
   return {
@@ -1149,9 +1015,9 @@ export function reducer(state: AppState, action: Action): AppState {
     if (owner) {
       const frames = [...(state.backgroundThreadEvents[action.threadId] ?? []), action].slice(-256);
       const buffered = { ...state, backgroundThreadEvents: { ...state.backgroundThreadEvents, [action.threadId]: frames } };
-      return action.type === "messageAdded"
-        ? bumpThreadUpdatedAt(buffered, action.threadId, action.message.at)
-        : buffered;
+      return (action.type === "messageAdded" || action.type === "messagePatched") && movesThreadToTop(action.message)
+        ? bumpThreadUpdatedAt(buffered, action.threadId, action.message.at, true, action.message.turnCompletedAt ?? action.message.at)
+        : action.type === "messageAdded" ? bumpThreadUpdatedAt(buffered, action.threadId, action.message.at) : buffered;
     }
   }
   switch (action.type) {
@@ -1229,6 +1095,7 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: false,
         inspectorOpen: false,
         activityOpen: false,
+        notificationsOpen: false,
         appSettingsOpen: false,
         pluginsOpen: false,
         triggersOpen: false,
@@ -1236,16 +1103,12 @@ export function reducer(state: AppState, action: Action): AppState {
     case "showChat":
       return state.activeView === "chat" ? state : { ...state, activeView: "chat" };
     case "showTeamMap":
+    case "showFiles":
       return {
         ...state,
-        activeView: "team-map",
-        settingsOpen: false,
-        computerOpen: false,
-        inspectorOpen: false,
-        activityOpen: false,
-        appSettingsOpen: false,
-        pluginsOpen: false,
-        triggersOpen: false,
+        activeView: action.type === "showFiles" ? "files" : "team-map",
+        filesSuggest: action.type === "showFiles" && action.suggest?.length ? action.suggest : null,
+        settingsOpen: false, computerOpen: false, inspectorOpen: false, activityOpen: false, appSettingsOpen: false, pluginsOpen: false, triggersOpen: false,
       };
     case "routinesHydrated":
       return { ...state, routines: action.routines, routineRuns: trimRoutineRuns(action.runs), routinesLoadState: "ready" };
@@ -1471,7 +1334,7 @@ export function reducer(state: AppState, action: Action): AppState {
         const group = state.groups.find((g) => g.threadId === action.threadId || g.tasks?.some((task) => task.threadId === action.threadId));
         if (!group) return state;
         if (group.threadId === action.threadId && group.messages.some((m) => m.id === action.message.id)) return state;
-        const stamped = bumpThreadUpdatedAt(state, action.threadId, action.message.at);
+        const stamped = bumpThreadUpdatedAt(state, action.threadId, action.message.at, movesThreadToTop(action.message), action.message.turnCompletedAt ?? action.message.at);
         if (group.threadId !== action.threadId) return stamped;
         const optimisticIndex = action.message.sendId
           ? group.messages.findIndex(
@@ -1496,7 +1359,7 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       // The POST response and its SSE frame race; moving the leaf back to a repeat can hide a newer reply.
       if (bot.messages.some((message) => message.id === action.message.id)) return state;
-      const stamped = bumpThreadUpdatedAt(state, action.threadId, action.message.at);
+      const stamped = bumpThreadUpdatedAt(state, action.threadId, action.message.at, movesThreadToTop(action.message), action.message.turnCompletedAt ?? action.message.at);
       const optimisticId = action.message.sendId
         ? optimisticMessageId(action.message.sendId)
         : null;
@@ -1538,41 +1401,48 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case "optimisticMessageRemoved": {
       const id = optimisticMessageId(action.sendId);
+      const remove = (messages: Message[], optimistic: Message) => messages
+        .filter((message) => message.id !== id)
+        .map((message) => message.optimisticThreadOrderAt === optimistic.at
+          ? { ...message, optimisticThreadOrderAt: optimistic.optimisticThreadOrderAt }
+          : message);
       const bot = state.bots.find((candidate) => candidate.threadId === action.threadId);
       if (bot) {
         const optimistic = bot.messages.find((message) => message.id === id);
         if (!optimistic) return state;
         const cleared = updateBot(state, bot.id, (current) => ({
           ...current,
-          messages: current.messages.filter((message) => message.id !== id),
+          messages: remove(current.messages, optimistic),
           activeLeafId: current.activeLeafId === id
             ? (action.restoreLeafId !== undefined ? action.restoreLeafId : (optimistic.parentId ?? null))
             : current.activeLeafId,
         }));
         const task = bot.tasks?.find((candidate) => candidate.threadId === action.threadId);
         const kept = cleared.bots.find((candidate) => candidate.id === bot.id)?.messages ?? [];
-        return rewindThreadUpdatedAt(cleared, action.threadId, kept, task?.createdAt ?? 0);
+        return rewindThreadUpdatedAt(cleared, action.threadId, kept, task?.createdAt ?? 0, bot.hasMore ? optimistic.optimisticThreadOrderAt : undefined);
       }
       const group = state.groups.find((candidate) => candidate.threadId === action.threadId);
-      if (!group || !group.messages.some((message) => message.id === id)) return state;
+      const optimistic = group?.messages.find((message) => message.id === id);
+      if (!group || !optimistic) return state;
       const cleared = {
         ...state,
         groups: state.groups.map((candidate) => candidate.id === group.id
-          ? { ...candidate, messages: candidate.messages.filter((message) => message.id !== id) }
+          ? { ...candidate, messages: remove(candidate.messages, optimistic) }
           : candidate),
       };
       const task = group.tasks?.find((candidate) => candidate.threadId === action.threadId);
       const kept = cleared.groups.find((candidate) => candidate.id === group.id)?.messages ?? [];
-      return rewindThreadUpdatedAt(cleared, action.threadId, kept, task?.createdAt ?? group.createdAt);
+      return rewindThreadUpdatedAt(cleared, action.threadId, kept, task?.createdAt ?? group.createdAt, group.hasMore ? optimistic.optimisticThreadOrderAt : undefined);
     }
     case "messagePatched": {
-      const bot = state.bots.find((b) => b.threadId === action.threadId);
+      const stamped = movesThreadToTop(action.message) ? bumpThreadUpdatedAt(state, action.threadId, action.message.at, true, action.message.turnCompletedAt ?? action.message.at) : state;
+      const bot = stamped.bots.find((b) => b.threadId === action.threadId);
       if (!bot) {
-        const group = state.groups.find((g) => g.threadId === action.threadId);
-        if (!group) return state;
+        const group = stamped.groups.find((g) => g.threadId === action.threadId);
+        if (!group) return stamped;
         return {
-          ...state,
-          groups: state.groups.map((g) =>
+          ...stamped,
+          groups: stamped.groups.map((g) =>
             g.id === group.id
               ? { ...g, messages: g.messages.map((m) => (m.id === action.message.id ? action.message : m)) }
               : g,
@@ -1587,7 +1457,7 @@ export function reducer(state: AppState, action: Action): AppState {
               ? "success"
               : "working"
           : null;
-      const next = motion ? withMascotMotion(state, bot.id, motion) : state;
+      const next = motion ? withMascotMotion(stamped, bot.id, motion) : stamped;
       return updateBot(next, bot.id, (b) => ({
         ...b,
         messages: b.messages.map((m) => (m.id === action.message.id ? action.message : m)),
@@ -1747,6 +1617,7 @@ export function reducer(state: AppState, action: Action): AppState {
         inspectorOpen: open ? false : state.inspectorOpen,
         activityOpen: open ? false : state.activityOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        notificationsOpen: open && !state.notificationsPinned ? false : state.notificationsOpen,
       };
     }
     case "toggleInspector": {
@@ -1758,6 +1629,7 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         activityOpen: open ? false : state.activityOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        notificationsOpen: open && !state.notificationsPinned ? false : state.notificationsOpen,
       };
     }
     case "toggleActivity": {
@@ -1769,8 +1641,28 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        notificationsOpen: open && !state.notificationsPinned ? false : state.notificationsOpen,
       };
     }
+    case "toggleNotifications": {
+      const open = action.open ?? !state.notificationsOpen;
+      return {
+        ...state,
+        notificationsOpen: open,
+        settingsOpen: open ? false : state.settingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
+        activityOpen: open ? false : state.activityOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+      };
+    }
+    case "toggleNotificationsPinned":
+      return { ...state, notificationsPinned: action.pinned ?? !state.notificationsPinned };
+    case "notificationsHydrated":
+    case "notificationReceived":
+    case "notificationRead":
+    case "notificationsMarkAllRead":
+      return { ...state, notifications: reduceNotificationFeed(state.notifications, action) };
     case "toggleAppSettings": {
       const open = action.open ?? !state.appSettingsOpen;
       return {
@@ -1785,6 +1677,7 @@ export function reducer(state: AppState, action: Action): AppState {
         inspectorOpen: open ? false : state.inspectorOpen,
         pluginsOpen: open ? false : state.pluginsOpen,
         triggersOpen: open ? false : state.triggersOpen,
+        notificationsOpen: open && !state.notificationsPinned ? false : state.notificationsOpen,
       };
     }
     case "toggleShortcuts": {
@@ -1835,7 +1728,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const {
         acknowledgeLocalAuto: _localAck,
         applyToAllThreads: _allThreads,
-        keepThreadModels: _keepThreadModels,
+        keepThreadModels: _keepThreadModels, threadId: _threadId,
         computer,
         connectorTools,
         connectorScopes,
@@ -1944,11 +1837,12 @@ export function reducer(state: AppState, action: Action): AppState {
         action.replyToId,
         bot.activeLeafId,
       );
+      message.optimisticThreadOrderAt = bot.tasks?.find((task) => task.threadId === threadId)?.lastThreadOrderAt;
       return bumpThreadUpdatedAt(updateBot(animated, bot.id, (current) => ({
         ...current,
         messages: [...current.messages, message],
         activeLeafId: message.id,
-      })), threadId, message.at);
+      })), threadId, message.at, true);
     }
     case "editMessage": {
       const animated = withMascotMotion(state, action.botId, "working");
@@ -1965,11 +1859,12 @@ export function reducer(state: AppState, action: Action): AppState {
         source.replyToId,
         source.parentId ?? null,
       );
-      return updateBot(animated, bot.id, (current) => ({
+      message.optimisticThreadOrderAt = bot.tasks?.find((task) => task.threadId === threadId)?.lastThreadOrderAt;
+      return bumpThreadUpdatedAt(updateBot(animated, bot.id, (current) => ({
         ...current,
         messages: [...current.messages, message],
         activeLeafId: message.id,
-      }));
+      })), threadId, message.at, true);
     }
     case "deleteTask":
     case "newGroupTask":
@@ -2105,7 +2000,8 @@ export function reducer(state: AppState, action: Action): AppState {
         null,
         action.mode ?? "chat",
       );
-      const stamped = bumpThreadUpdatedAt(state, threadId, message.at);
+      message.optimisticThreadOrderAt = group.tasks?.find((task) => task.threadId === threadId)?.lastThreadOrderAt;
+      const stamped = bumpThreadUpdatedAt(state, threadId, message.at, threadId === group.threadId);
       if (threadId !== group.threadId) return stamped;
       return {
         ...stamped,
@@ -2150,6 +2046,7 @@ export const initialState: AppState = {
   routineRuns: [],
   routinesLoadState: "loading",
   routinesFocus: { nonce: 0 },
+  filesSuggest: null,
   webhooks: [],
   webhookAttempts: [],
   webhookIngress: null,
@@ -2162,6 +2059,9 @@ export const initialState: AppState = {
   computerOpen: false,
   inspectorOpen: false,
   activityOpen: false,
+  notificationsOpen: false,
+  notificationsPinned: false,
+  notifications: [],
   appSettingsOpen: false,
   appSettingsSection: "general",
   appSettingsCloudLink: 0,
@@ -2596,7 +2496,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
 
     const wrapped: React.Dispatch<Action> = (action) => {
-      if (["select", "newTask", "switchTask", "newGroupTask", "switchGroupTask", "showChat", "showRoutines", "showTeamMap"].includes(action.type)) selectionRevision++;
+      if (["select", "newTask", "switchTask", "newGroupTask", "switchGroupTask", "showChat", "showRoutines", "showTeamMap", "showFiles"].includes(action.type)) selectionRevision++;
       // Pin before any await or optimistic state change.
       action = pinBotThreadAction(action, stateRef.current.bots);
       if (action.type === "taskSwitched") action = { ...action, bot: withTaskWrites(action.bot) as Bot };
@@ -2981,10 +2881,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // A copy of a restricted bot is restricted from its first moment.
           api("/api/bots", {
             method: "POST",
-            body: JSON.stringify({
-              ...(source.visibility && source.visibility !== "everyone" ? { visibility: source.visibility } : {}),
-              ...(Object.hasOwn(source, "toolScope") ? { settings: { toolScope: source.toolScope } } : {}),
-            }),
+            body: JSON.stringify(restrictedCopyRequest(source)),
           })
             .then(({ bot }) =>
               api(`/api/bots/${bot.id}`, {
@@ -3116,7 +3013,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (botBeforeUpdate) {
             botPatchQueue.enqueue(
               action.botId,
-              { modelSelection: action.selection },
+              { modelSelection: action.selection, threadId: botBeforeUpdate.switchingTo ?? botBeforeUpdate.threadId },
               botBeforeUpdate,
             );
           }
@@ -3304,7 +3201,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let alive = true;
-    type PeripheralKey = "instances" | "config" | "routines" | "webhooks";
+    type PeripheralKey = "instances" | "config" | "routines" | "webhooks" | "notifications";
     type PeripheralPart = {
       key: PeripheralKey;
       request: () => Promise<() => void>;
@@ -3344,6 +3241,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         request: async () => {
           const { routines, runs } = await api("/api/routines");
           return () => rawDispatch({ type: "routinesHydrated", routines, runs });
+        },
+      },
+      {
+        key: "notifications",
+        request: async () => {
+          const { notifications } = await api("/api/notifications");
+          return () => rawDispatch({ type: "notificationsHydrated", notifications: Array.isArray(notifications) ? notifications : [] });
         },
       },
       ...(window.ogb?.remoteClient?.active ? [] : [{
@@ -3541,6 +3445,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             stateRef.current.bots.find((bot) => bot.id === frame.notification.botId)?.avatarUrl,
             visibleNotificationThread(stateRef.current),
           );
+          rawDispatch({ type: "notificationReceived", entry: frame.notification });
           break;
         case "group.deleted":
           rawDispatch({ type: "groupDeleted", groupId: frame.groupId });

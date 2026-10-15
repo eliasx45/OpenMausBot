@@ -109,8 +109,7 @@ export function resolveTeammate<T extends RosterMember>(
   const wanted = raw.trim();
   if (bots.some(bot => bot.id === wanted)) return { id: wanted, byName: false };
   const fold = (value: string) => value.replace(/^@/, "").replace(/\s+/g, " ").trim().toLowerCase();
-  // Models slug a name they saw ("Reviewer 2" → "reviewer-2"): dashes and
-  // underscores read as spaces, but only when that names one teammate.
+  // Models slug names they saw ("Reviewer 2" → "reviewer-2").
   const loose = (value: string) => fold(value.replace(/[-_]+/g, " "));
   const name = fold(wanted);
   const shown = peerName(wanted) || wanted;
@@ -126,11 +125,8 @@ export function resolveTeammate<T extends RosterMember>(
   return { error: `No bot with id or name "${shown}" — call list_bots and copy the exact id from the result.${teammateChoices(reachable)} ${PEER_ACCESS_HELP}` };
 }
 
-/** How many teammates a not-found refusal lists; list_bots has the rest. */
 const CHOICES_MAX = 12;
 
-/** The teammates a refused name could have meant, as a refusal lists them:
- * names flattened like the roster's, each with the id to copy. */
 function teammateChoices(reachable: readonly RosterMember[]): string {
   if (!reachable.length) return "";
   const listed = reachable.slice(0, CHOICES_MAX).map(bot => `${peerName(bot.name)} (id ${bot.id})`).join(", ");

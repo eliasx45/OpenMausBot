@@ -1,4 +1,4 @@
-import { learnedSkillDirectoryMatches } from "./skill-content.ts";
+import { learnedSkillDirectoryMatches } from "./skill-storage.ts";
 // Per-bot skill copies move into the shared library; originals are archived write-once, and a manifest entry is dropped only after its archive and assignment are durable.
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from "node:fs";

@@ -5,21 +5,14 @@
  */
 export type SkillRequestAction = "create" | "update";
 
-/** What sharing a learned skill with the author's team did
- * (features.shareLearnedSkills), kept on the receipt so Undo can revert the
- * library write and the assignments together. */
+/** Kept on the receipt so Undo reverts the library write and the assignments together. */
 export interface SkillShareRecord {
-  /** installed: this share put the skill in the library; deduplicated: the
-   * identical bytes were already there; assigned: it was already a library
-   * skill; updated: a shared skill's library copy was rewritten. */
+  /** deduplicated: identical bytes were already in the library; assigned: it already was a library skill. */
   library: "installed" | "deduplicated" | "assigned" | "updated";
-  /** The library SKILL.md sha256 this share left. */
   sha256: string;
   referencesSha256?: string;
   sharedAt: number;
-  /** Bots this share assigned the skill to. */
   assigned: Array<{ botId: string; name: string }>;
-  /** Teammates left out, and why (a same-named private skill). */
   skipped: Array<{ botId: string; name: string; reason: string }>;
 }
 
@@ -38,19 +31,16 @@ export interface SkillRequestCardData {
   preview?: string;
   /** Binds approval to the exact bytes shown in preview. */
   sha256?: string;
-  /** references/<topic>.md files the skill keeps beside SKILL.md, shown in
-   * full with it. Absent: the skill is SKILL.md alone. */
+  /** references/<topic>.md files shown in full beside the SKILL.md; absent when the skill is SKILL.md alone. */
   references?: Array<{ path: string; content: string }>;
-  /** Hash over `references` (server/skills.ts skillReferencesSha256). */
+  /** Binds approval to the exact references shown. */
   referencesSha256?: string;
   warnings: string[];
   createdAt: number;
   /** An update that applied without a person: the SKILL.md it replaced, so
    * Undo can put it back while the skill is unchanged since. */
   previous?: { preview: string; source: string; references?: Array<{ path: string; content: string }> };
-  /** Set once the skill was shared with the team. */
   shared?: SkillShareRecord;
-  /** Why sharing this skill did not happen, when it was tried. */
   shareError?: string;
 }
 

@@ -38,8 +38,9 @@ import {
   undoSkillWrite,
 } from "./skills.ts";
 import { parseSkillSource } from "./skill-fetch.ts";
+import { ensureTaskWorkspaceWithSkills, syncTaskSkillLinks } from "./skill-task-links.ts";
 import { buildSystemPrompt } from "./system-prompt.ts";
-import { workspaceDir } from "./workspace.ts";
+import { ensureTaskWorkspace, TASK_WORKSPACES_DIR, workspaceDir } from "./workspace.ts";
 
 // skills.ts reads OMB_DATA_DIR at import time, so tests isolate by a unique botId each.
 const SKILL = (name: string, description = "Reviews a PR the way this team reviews PRs.") =>
@@ -200,6 +201,21 @@ describe("parseSkillMd", () => {
     expect(parsed).toMatchObject({ name: "code-review", description: expect.stringContaining("Reviews") });
     if (!("error" in parsed)) expect(parsed.body).toContain("Do the thing.");
   });
+
+  it("reads descriptions with a colon+space, an unmatched quote, or wrapping quotes without losing bytes", () => {
+    const cases: Array<[string, string]> = [
+      ["Show me your work: evidence, not vibes.", "Show me your work: evidence, not vibes."],
+      ['Proves it works, then shows the receipt"', 'Proves it works, then shows the receipt"'],
+      ['"Use this when: deploying fragile services"', "Use this when: deploying fragile services"],
+      ["'aren't truncated by the reader'", "aren't truncated by the reader"],
+      ['"Escaped \\"inner\\" quotes survive"', 'Escaped "inner" quotes survive'],
+    ];
+    for (const [frontmatter, description] of cases) {
+      const parsed = parseSkillMd(SKILL("quote-safe", frontmatter));
+      expect("error" in parsed, `${frontmatter} must parse`).toBe(false);
+      if (!("error" in parsed)) expect(parsed.description).toBe(description);
+    }
+  });
 });
 
 describe("scanSkillText", () => {
@@ -251,6 +267,67 @@ describe("install → review → enable lifecycle", () => {
     expect(JSON.parse(readFileSync(record, "utf8"))).toEqual([]);
   });
 
+  it("links enabled skills into the thread's own task folder and revokes them on disable", () => {
+    installSkill(bot, "src", [{ path: "SKILL.md", content: SKILL("task-skill") }]);
+    setSkillEnabled(bot, "task-skill", true);
+    const thread = "thread-a";
+    const taskDir = ensureTaskWorkspace(bot, thread);
+    try {
+      syncTaskSkillLinks(bot, thread);
+      for (const dir of [".claude/skills", ".agents/skills", ".grok/skills"]) {
+        const path = join(taskDir, dir, "task-skill");
+        expect(lstatSync(path).isSymbolicLink(), `${dir} link should exist`).toBe(true);
+        expect(realpathSync(join(path, "SKILL.md"))).toBe(realpathSync(join(workspaceDir(bot), "skills", "task-skill", "SKILL.md")));
+      }
+      const record = join(DATA_DIR, "skill-state", bot, "task-links", `${thread}.json`);
+      expect(JSON.parse(readFileSync(record, "utf8"))).toEqual(["task-skill"]);
+
+      setSkillEnabled(bot, "task-skill", false);
+      syncTaskSkillLinks(bot, thread);
+      for (const dir of [".claude/skills", ".agents/skills", ".grok/skills"]) {
+        expect(existsSync(join(taskDir, dir, "task-skill"))).toBe(false);
+      }
+      expect(JSON.parse(readFileSync(record, "utf8"))).toEqual([]);
+    } finally {
+      rmSync(join(TASK_WORKSPACES_DIR, bot), { recursive: true, force: true });
+    }
+  });
+
+  it("never replaces a same-name folder the bot made in its task folder", () => {
+    installSkill(bot, "src", [{ path: "SKILL.md", content: SKILL("own-skill") }]);
+    setSkillEnabled(bot, "own-skill", true);
+    const thread = "thread-b";
+    const taskDir = ensureTaskWorkspace(bot, thread);
+    try {
+      const own = join(taskDir, ".claude", "skills", "own-skill");
+      mkdirSync(own, { recursive: true });
+      writeFileSync(join(own, "SKILL.md"), "mine");
+      syncTaskSkillLinks(bot, thread);
+      expect(lstatSync(own).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(own, "SKILL.md"), "utf8")).toBe("mine");
+      expect(lstatSync(join(taskDir, ".agents", "skills", "own-skill")).isSymbolicLink()).toBe(true);
+
+      setSkillEnabled(bot, "own-skill", false);
+      syncTaskSkillLinks(bot, thread);
+      expect(readFileSync(join(own, "SKILL.md"), "utf8")).toBe("mine");
+      expect(existsSync(join(taskDir, ".agents", "skills", "own-skill"))).toBe(false);
+    } finally {
+      rmSync(join(TASK_WORKSPACES_DIR, bot), { recursive: true, force: true });
+    }
+  });
+
+  it("hands a turn its task folder with the enabled skills already linked", () => {
+    installSkill(bot, "src", [{ path: "SKILL.md", content: SKILL("turn-skill") }]);
+    setSkillEnabled(bot, "turn-skill", true);
+    try {
+      const folder = ensureTaskWorkspaceWithSkills(bot, "thread-c");
+      expect(folder).toBe(ensureTaskWorkspace(bot, "thread-c"));
+      expect(lstatSync(join(folder, ".claude", "skills", "turn-skill")).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(join(TASK_WORKSPACES_DIR, bot), { recursive: true, force: true });
+    }
+  });
+
   it("stores only the reviewed SKILL.md and reports every supporting file", () => {
     const installed = installSkill(bot, "src", [
       { path: "SKILL.md", content: SKILL("deploy-helper") },
@@ -275,6 +352,54 @@ describe("install → review → enable lifecycle", () => {
 
     const again = installSkill(bot, "src", [{ path: "SKILL.md", content: SKILL("deploy-helper") }]);
     expect("error" in again).toBe(true);
+  });
+
+  it("imports a colon-and-quote description byte-faithfully and re-reads the same value", () => {
+    const source = '---\nname: show-me-your-work\ndescription: Show me your work: evidence, not vibes.\n---\n\n# Show me your work\n\nBody.\n';
+    const installed = installSkill(bot, "src", [{ path: "SKILL.md", content: source }]);
+    expect(installed).toMatchObject({ name: "show-me-your-work", description: "Show me your work: evidence, not vibes." });
+    const stored = readSkillFile(bot, "show-me-your-work");
+    expect(stored).toBe(source);
+    const reread = parseSkillMd(stored ?? "");
+    expect("error" in reread).toBe(false);
+    if (!("error" in reread)) expect(reread.description).toBe("Show me your work: evidence, not vibes.");
+  });
+
+  it("imports a description that ends in a quote without truncating it", () => {
+    const source = '---\nname: prove-it-works\ndescription: Proves it works, then shows the receipt"\n---\n\n# Prove it works\n\nBody.\n';
+    const installed = installSkill(bot, "src", [{ path: "SKILL.md", content: source }]);
+    expect(installed).toMatchObject({ name: "prove-it-works", description: 'Proves it works, then shows the receipt"' });
+    expect(readSkillFile(bot, "prove-it-works")).toBe(source);
+  });
+
+  it("imports a double-quoted description and unwraps it for the listing", () => {
+    const source = '---\nname: quoted-deploy\ndescription: "Use this when: deploying fragile services"\n---\n\n# Quoted deploy\n\nBody.\n';
+    const installed = installSkill(bot, "src", [{ path: "SKILL.md", content: source }]);
+    expect(installed).toMatchObject({ name: "quoted-deploy", description: "Use this when: deploying fragile services" });
+    expect(readSkillFile(bot, "quoted-deploy")).toBe(source);
+  });
+
+  it("preserves extra frontmatter fields such as disable-model-invocation through install", () => {
+    const source = "---\nname: gated\ndescription: Only the person can run it.\ndisable-model-invocation: true\nallowed-tools: Read, Grep\n---\n\n# Gated\n\nBody.\n";
+    const installed = installSkill(bot, "src", [{ path: "SKILL.md", content: source }]);
+    expect(installed).toMatchObject({ name: "gated" });
+    expect(readSkillFile(bot, "gated")).toBe(source);
+  });
+
+  it("reports non-markdown siblings and subfolders in skippedFiles, not an empty list", () => {
+    const installed = installSkill(bot, "src", [
+      { path: "SKILL.md", content: SKILL("solo-markdown") },
+      { path: "run.sh", content: "" },
+      { path: "scripts/", content: "" },
+    ]);
+    expect(installed).toMatchObject({
+      name: "solo-markdown",
+      skippedFiles: ["run.sh", "scripts/"],
+      warnings: [
+        expect.stringContaining("run.sh"),
+        expect.stringContaining("scripts/"),
+      ],
+    });
   });
 
   it("removes cleanly", () => {

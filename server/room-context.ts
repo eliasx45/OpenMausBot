@@ -1,5 +1,6 @@
 import type { ModelCatalog } from "./contracts.ts";
 import { contextWindowFor } from "./context-budget.ts";
+import { sessionIdlePolicy } from "./drivers/session-idle.ts";
 
 export const DEFAULT_ROOM_COMPACT_AT = 0.9;
 
@@ -12,28 +13,32 @@ export function roomCompactTokens(window: number, settings: { autoCompact?: bool
   return value < 1 ? Math.floor(window * value) : Math.floor(value);
 }
 
-/** A reading, with the engine its process runs on and when it was taken. */
 type Measured = RoomMemberContext & { instanceId?: string; at: number };
 
 export type RoomContextClock = {
-  /** How long a quiet warm process lives (sessionIdlePolicy). */
-  idleMs: number;
-  /** When the room thread's keep-warm hold ends, if it has one. */
+  idleMs?: number;
   heldUntil?: (threadId: string) => number | undefined;
   now?: () => number;
-  /** A reading aged out on its own: the room's banner should update. */
   expired?: (threadId: string) => void;
 };
 
+type RoomReset = { reason: "requested" | "threshold"; percent: number };
+
+export function roomResetNote(name: string, reset: RoomReset): string {
+  return reset.reason === "requested"
+    ? `compacted ${name}'s context (${reset.percent}% full): fresh session with the room's recent messages`
+    : `${name}'s context was ${reset.percent}% full: compacted to a fresh session with the room's recent messages`;
+}
+
 export class RoomContextTracker {
   private threads = new Map<string, Map<string, Measured>>();
-  /** The engine each member's latest turn in a thread was dispatched on. */
-  private engines = new Map<string, Map<string, string>>();
-
+  private dispatchedOn = new Map<string, Map<string, string>>();
   private readonly clock: RoomContextClock;
+  private readonly idleMs: number;
 
-  constructor(clock: RoomContextClock) {
+  constructor(clock: RoomContextClock = {}) {
     this.clock = clock;
+    this.idleMs = clock.idleMs ?? Math.max(sessionIdlePolicy("CLAUDE").idleMs, sessionIdlePolicy("ACP").idleMs);
   }
 
   record(threadId: string, botId: string, reading: { tokens?: number; window?: number } | undefined, model: string | undefined, catalog?: ModelCatalog): void {
@@ -41,7 +46,7 @@ export class RoomContextTracker {
     if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) return;
     const members = this.threads.get(threadId) ?? new Map<string, Measured>();
     const previous = this.live(threadId, botId);
-    const instanceId = this.engines.get(threadId)?.get(botId);
+    const instanceId = this.dispatchedOn.get(threadId)?.get(botId);
     const measured: Measured = {
       tokens: Math.trunc(tokens),
       window: contextWindowFor(model, catalog, reading?.window),
@@ -70,14 +75,17 @@ export class RoomContextTracker {
       [botId, { tokens, window, ...(compactRequested ? { compactRequested } : {}) }]));
   }
 
-  /** At dispatch, after takeReset: this member's turn takes the thread's
-   * warm process slot on its engine, so the other members measured on that
-   * engine lose theirs. Members on another engine keep their process (each
-   * engine pools its own). Returns whether any reading went. */
+  dispatch(threadId: string, botId: string, instanceId: string, settings: { autoCompact?: boolean; roomCompactAt?: number } | undefined):
+    { reset: RoomReset | null; displaced: boolean } {
+    const reset = this.takeReset(threadId, botId, settings);
+    return { reset, displaced: this.dispatched(threadId, botId, instanceId) };
+  }
+
+  /** Each engine keeps one warm process per thread, so this turn closes the other members' processes on its engine. */
   dispatched(threadId: string, botId: string, instanceId: string): boolean {
-    const engines = this.engines.get(threadId) ?? new Map<string, string>();
+    const engines = this.dispatchedOn.get(threadId) ?? new Map<string, string>();
     engines.set(botId, instanceId);
-    this.engines.set(threadId, engines);
+    this.dispatchedOn.set(threadId, engines);
     const members = this.threads.get(threadId);
     if (!members) return false;
     let dropped = false;
@@ -91,8 +99,7 @@ export class RoomContextTracker {
     return dropped;
   }
 
-  takeReset(threadId: string, botId: string, settings: { autoCompact?: boolean; roomCompactAt?: number } | undefined):
-    { reason: "requested" | "threshold"; percent: number } | null {
+  takeReset(threadId: string, botId: string, settings: { autoCompact?: boolean; roomCompactAt?: number } | undefined): RoomReset | null {
     const current = this.live(threadId, botId);
     const members = this.threads.get(threadId);
     if (!members || !current) return null;
@@ -107,21 +114,17 @@ export class RoomContextTracker {
 
   forget(threadId: string): void {
     this.threads.delete(threadId);
-    this.engines.delete(threadId);
+    this.dispatchedOn.delete(threadId);
   }
 
   private now(): number {
     return this.clock.now?.() ?? Date.now();
   }
 
-  /** Idle closes count from when the turn settled, which is when the
-   * reading was taken; a keep-warm hold can keep the process past that. */
   private warmUntil(threadId: string, reading: Measured): number {
-    return Math.max(reading.at + this.clock.idleMs, this.clock.heldUntil?.(threadId) ?? 0);
+    return Math.max(reading.at + this.idleMs, this.clock.heldUntil?.(threadId) ?? 0);
   }
 
-  /** Tells `expired` once this reading ages out, unless it was replaced or
-   * consumed first. The timer never keeps the server alive. */
   private watch(threadId: string, botId: string, reading: Measured): void {
     const expired = this.clock.expired;
     if (!expired) return;
@@ -137,8 +140,6 @@ export class RoomContextTracker {
     arm(this.warmUntil(threadId, reading) - this.now());
   }
 
-  /** A member's reading while its process can still be warm; a stale one
-   * is dropped. */
   private live(threadId: string, botId: string): Measured | undefined {
     const members = this.threads.get(threadId);
     const current = members?.get(botId);

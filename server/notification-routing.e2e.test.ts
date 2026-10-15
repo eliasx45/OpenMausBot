@@ -296,9 +296,10 @@ describe("a reply that tags the person", () => {
         groupId: room.id,
         title: "Tagger in Spec Review mentioned you",
         body: "@you three open questions are blocking Section 2 & 3.",
+        id: expect.any(String),
+        at: expect.any(Number),
+        read: false,
       });
-      // the room's turn is over once it stops working; by then any second
-      // frame for the same turn would already be on the wire
       await expect.poll(async () => (await groupState(room.id))?.working, { timeout: 20_000 }).toBe(false);
       const frames = stream.frames.filter(
         (candidate) => candidate.kind === "notify" && candidate.notification?.botId === bot.id,

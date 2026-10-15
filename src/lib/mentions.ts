@@ -4,15 +4,21 @@ import { isMentionBoundary, isMentionNameContinuation } from "../../shared/menti
 import { personTagAt, personTagNames } from "../../shared/person-mention";
 
 export type MentionPeer = { name: string; hidden?: boolean; color?: MausColor };
-/** `you` marks the person's own tag (`@you`, or `@<their name>`). */
 export type MentionRange = { start: number; end: number; color?: string; you?: true };
-/** Recognize the person's tag too. Off unless a caller asks: the composer
- * keeps coloring only what routes to a bot. */
 export type MentionPerson = { profileName?: string | null };
 
-/** Whether two bubbles color the person's tag the same way (memo check). */
 export function sameMentionPerson(a?: MentionPerson, b?: MentionPerson): boolean {
   return Boolean(a) === Boolean(b) && (a?.profileName ?? "") === (b?.profileName ?? "");
+}
+
+export function mentionQueryAt(text: string, caret: number): { start: number; query: string } | null {
+  const upto = text.slice(0, caret);
+  const at = upto.lastIndexOf("@");
+  if (at === -1) return null;
+  if (at > 0 && !/\s/.test(upto[at - 1])) return null;
+  const query = upto.slice(at + 1);
+  if (query.length > 24 || query.includes("@") || query.includes("\n")) return null;
+  return { start: at, query };
 }
 
 export function mentionChoicesForQuery<T extends { name: string }>(pool: readonly T[], query: string): T[] {
@@ -54,7 +60,6 @@ export function mentionRanges(text: string, peers: readonly MentionPeer[], every
       && !isMentionNameContinuation(rest.slice(name.length)));
     const all = everyone && rest.slice(0, 8).toLowerCase() === "everyone"
       && !isMentionNameContinuation(rest.slice(8));
-    // A bot name wins a collision with the person's tag (shared/person-mention.ts).
     const you = !all && personNames.length ? personTagAt(rest, personNames, botNames) : undefined;
     if (you !== undefined) {
       ranges.push({ start: at, end: at + you + 1, you: true });
@@ -71,7 +76,6 @@ export function mentionRanges(text: string, peers: readonly MentionPeer[], every
   return ranges;
 }
 
-/** The person's tag has its own style; a bot's tag carries its color. */
 export function mentionClassName(range: Pick<MentionRange, "you">): string {
   return range.you ? "mention-highlight mention-you" : "mention-highlight";
 }

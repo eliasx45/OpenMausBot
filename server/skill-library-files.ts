@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { referenceLimitError } from "./skill-content.ts";
+import { referenceLimitError } from "./skill-storage.ts";
 
 export function writeLibraryFiles(directory: string, instructions: string, references: Array<{ path: string; content: string }>, commit: () => void): void {
   const error = referenceLimitError(references);

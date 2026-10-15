@@ -225,10 +225,8 @@ describe("resolveTeammate", () => {
     expect(resolveTeammate(reviewers, self, "reviewer-2")).toEqual({ id: "e2", byName: true });
     expect(resolveTeammate(reviewers, self, "Reviewer_2")).toEqual({ id: "e2", byName: true });
     expect(resolveTeammate(reviewers, self, "Reviewer 3")).toEqual({ id: "e3", byName: true });
-    // an exact name wins over a loose one
     const exact = [...reviewers, { id: "e2b", name: "reviewer-2", section: "Work" }];
     expect(resolveTeammate(exact, self, "reviewer-2")).toEqual({ id: "e2b", byName: true });
-    // two loose matches are refused, never guessed
     const twins = [...reviewers, { id: "e2c", name: "Reviewer_2", section: "Work" }];
     expect(resolveTeammate(twins, self, "reviewer-2")).toMatchObject({ error: expect.stringContaining('No bot with id or name "reviewer-2"') });
   });

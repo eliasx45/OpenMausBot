@@ -199,8 +199,6 @@ posixOnly("engine hooks e2e: a shell call that hit its time limit", () => {
 
   it("tells the engine how to rerun it, and the prompt said so up front", async () => {
     const bot = await h.runTurn();
-    // the fake echoes each failure hook's additionalContext into the reply:
-    // one hint per timed-out call, none for the ordinary failure
     const reply: Msg = bot.messages.filter((m: Msg) => m.role === "bot" && m.kind === "text" && m.text).at(-1);
     expect(reply.text!.match(/hit the shell time limit/g)).toHaveLength(2);
     expect(reply.text).toContain("up to 600000");
@@ -208,7 +206,6 @@ posixOnly("engine hooks e2e: a shell call that hit its time limit", () => {
     const preview = await h.api("GET", `/api/bots/${bot.id}/system-prompt`);
     const shell = preview.body.sections.find((s: { id: string }) => s.id === "shell");
     expect(shell?.text).toContain("Long-running shell commands");
-    // the turn the engine actually ran: same section, and the cap it names
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.systemPrompt).toContain(shell.text.trim());
     expect(seen.env.BASH_MAX_TIMEOUT_MS).toBe("600000");

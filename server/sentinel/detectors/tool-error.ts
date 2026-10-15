@@ -1,6 +1,4 @@
-// tool_error: every failed tool call, grouped by tool and normalized error.
-// A failure in one of OpenMausBot's own tools is ranked as a bug; a shell
-// command that exited non-zero is usually the bot's own business.
+import { isHeldMemberLine } from "../../room-holds.ts";
 import { failureKey, HARNESS_NOTICE, signatureOf, toolOrigin } from "../normalize.ts";
 import type { Detector, Observation, Origin, Severity } from "../types.ts";
 import { TURN_TIMEOUT_NOTICE } from "./turn-stop.ts";
@@ -15,6 +13,8 @@ export const toolError: Detector = {
       if (record.type !== "tool" || record.ok) continue;
       // a stopped room turn is turn_timeout's, not a tool's
       if (record.tool === HARNESS_NOTICE && TURN_TIMEOUT_NOTICE.test(record.text)) continue;
+      // a member the person held on purpose is not a failure
+      if (isHeldMemberLine(record.tool)) continue;
       const origin = toolOrigin(record.tool);
       const { key, title } = failureKey(record.tool, record.text);
       observations.push({

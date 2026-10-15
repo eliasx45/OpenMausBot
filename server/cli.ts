@@ -78,7 +78,7 @@ export interface CliOptions {
   /** `access list|add|remove` */
   accessAction?: "list" | "add" | "remove";
   chatOnly?: boolean;
-  /** `service install|uninstall [--sentinel]` */
+  /** `service install|uninstall` */
   serviceAction?: "install" | "uninstall";
   sentinel?: boolean;
   email?: string;

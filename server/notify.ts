@@ -63,29 +63,28 @@ export function buildNotification(
   return notification;
 }
 
-/** A settled room reply that tags the person (`@you`, or their profile name)
- * is the room asking for them. Room turns never send "done", so this is the
- * turn's one buzz; the caller leaves out bot-to-bot channels, which have no
- * person to ask. Every text the speaker posted this turn counts (a reply can
- * arrive in parts, and each part is shown to the person), and a visible room
- * member's name wins over the person's, as the renderer does. */
-export function buildMentionNotification(input: {
-  bot: NotifyBot & { avatarUrl?: string };
-  group: { id: string; name: string };
-  turnId?: string;
-  reply: string;
-  messages: readonly { role: string; kind: string; text?: string; turnId?: string; from?: { botId: string } }[];
-  members: readonly ({ name: string; hidden?: boolean } | null | undefined)[];
-  profileName?: string;
-}): Notification | null {
-  const { bot, group, turnId } = input;
-  const texts = turnId
-    ? input.messages.filter((m) => m.role === "bot" && m.kind === "text" && m.turnId === turnId && m.from?.botId === bot.id).map((m) => m.text ?? "")
-    : [input.reply];
-  const botNames = input.members.flatMap((member) => (member && !member.hidden ? [member.name] : []));
+type MentionSource = {
+  activePath(threadId: string): readonly { role: string; kind: string; text?: string; turnId?: string; from?: { botId: string } }[];
+  bot(id: string): { name: string; hidden?: boolean } | null | undefined;
+};
+
+export function buildMentionNotification(
+  source: MentionSource,
+  bot: Omit<NotifyBot, "threadId"> & { avatarUrl?: string },
+  room: { id: string; name: string; dm?: boolean; memberIds: readonly string[] },
+  turn: { threadId: string; turnId?: string; reply: string; profileName?: string },
+): Notification | null {
+  if (room.dm) return null;
+  const texts = turn.turnId
+    ? source.activePath(turn.threadId).filter((m) => m.role === "bot" && m.kind === "text" && m.turnId === turn.turnId && m.from?.botId === bot.id).map((m) => m.text ?? "")
+    : [turn.reply];
+  const botNames = room.memberIds.flatMap((id) => {
+    const member = source.bot(id);
+    return member && !member.hidden ? [member.name] : [];
+  });
   for (const text of texts) {
-    const excerpt = personMentionExcerpt(text, { profileName: input.profileName, botNames });
-    if (excerpt) return buildNotification("mention", bot, bot.threadId, excerpt, { avatarUrl: bot.avatarUrl, group });
+    const excerpt = personMentionExcerpt(text, { profileName: turn.profileName, botNames });
+    if (excerpt) return buildNotification("mention", { ...bot, threadId: turn.threadId }, turn.threadId, excerpt, { avatarUrl: bot.avatarUrl, group: room });
   }
   return null;
 }

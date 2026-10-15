@@ -47,6 +47,7 @@ function profiles(): Record<string, Profile> {
   for (const name of ["skills+shared+voice", "skills+shared+voice+non-chief"]) {
     all[`${name}+cloud-home`] = { env: { ...all[name]!.env, OMB_CLOUD_HOME: "1" } };
   }
+  all["skills+shared+voice+escalations"] = { env: { ...all["skills+shared+voice"]!.env, OMB_ESCALATIONS: "1" } };
   all["default+legacy-switches"] = {
     env: { ...all.default!.env, OMB_ROOM_TURN: "1", OMB_OWN_THREAD_CREATION: "1", OMB_EXTERNAL_RUNTIME: "1" },
   };
@@ -59,29 +60,30 @@ const CHIEF_TARGET_TOOLS = ["propose_profile", "propose_model"];
 const CHIEF_PROFILE_TARGET = " A Chief of Staff may pass for_bot_id (from list_bots) for a requested change to another bot in its section.";
 const TEAMWORK_TOOLS = ["list_room_targets", "coordinate_bots", "assignment_status", "list_bots", "list_rooms", "list_threads", "close_thread", "start_thread", "post_to_room"];
 /** The fullest profile, checked in whole; every other one is pinned by tool names, bytes and sha256. */
-const FULL = "skills+shared+voice";
+const FULL = "skills+shared+voice+escalations";
 
 /** Bytes when the budget was last set; a profile may move at most 2% either way (lower it to lock in a win). */
 const BUDGET_BASELINE: Record<string, number> = {
-  "default": 55739,
-  "voice": 56480,
-  "shared": 57484,
-  "shared+voice": 58225,
-  "skills": 58783,
-  "skills+voice": 59524,
-  "skills+shared": 60528,
-  "skills+shared+voice": 61269,
-  "non-chief": 46089,
-  "voice+non-chief": 46830,
-  "shared+non-chief": 47834,
-  "shared+voice+non-chief": 48575,
-  "skills+non-chief": 49133,
-  "skills+voice+non-chief": 49874,
-  "skills+shared+non-chief": 50878,
-  "skills+shared+voice+non-chief": 51619,
-  "skills+shared+voice+cloud-home": 60324,
-  "skills+shared+voice+non-chief+cloud-home": 50674,
-  "default+legacy-switches": 55739
+  "default": 55689,
+  "voice": 56430,
+  "shared": 57434,
+  "shared+voice": 58175,
+  "skills": 58588,
+  "skills+voice": 59329,
+  "skills+shared": 60333,
+  "skills+shared+voice": 61074,
+  "non-chief": 46039,
+  "voice+non-chief": 46780,
+  "shared+non-chief": 47784,
+  "shared+voice+non-chief": 48525,
+  "skills+non-chief": 48938,
+  "skills+voice+non-chief": 49679,
+  "skills+shared+non-chief": 50683,
+  "skills+shared+voice+non-chief": 51424,
+  "skills+shared+voice+cloud-home": 60129,
+  "skills+shared+voice+non-chief+cloud-home": 50479,
+  "skills+shared+voice+escalations": 61934,
+  "default+legacy-switches": 55689,
 };
 
 const RPC_PREFIX = '{"jsonrpc":"2.0","id":1,"result":';
@@ -195,6 +197,14 @@ describe("agents proxy tools/list golden", () => {
     }
   });
 
+  it("mounts raise_escalation only where chief escalations are on", () => {
+    const names = (wire: string) => toolsOf(wire).map((tool) => tool.name);
+    expect(names(wires[FULL]!).filter((tool) => tool !== "raise_escalation")).toEqual(names(wires["skills+shared+voice"]!));
+    for (const [name, profile] of Object.entries(PROFILES)) {
+      expect(names(wires[name]!).includes("raise_escalation"), name).toBe(profile.env.OMB_ESCALATIONS === "1");
+    }
+  });
+
   it("ignores the switches that once picked a catalog profile", () => {
     expect(wires["default+legacy-switches"]).toBe(wires.default);
     const profile = catalogProfileFromEnv({ OMB_BOT_ID: "bot-golden", OMB_CHIEF_OF_STAFF: "1", OMB_ROOM_TURN: "1", OMB_OWN_THREAD_CREATION: "1", OMB_EXTERNAL_RUNTIME: "1" });
@@ -299,7 +309,7 @@ describe("agents proxy tools/list from the packaged bundle", () => {
 
 describe("agents proxy tools/list wire size", () => {
   it("prints per-tool and total UTF-8 bytes", () => {
-    const shown = [FULL, `${FULL}+non-chief`];
+    const shown = [FULL, "skills+shared+voice+non-chief"];
     const perTool = new Map<string, Record<string, number>>();
     for (const name of shown) {
       for (const tool of toolsOf(wires[name]!)) {

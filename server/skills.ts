@@ -1,5 +1,4 @@
-import { publishReviewedRevision } from "./skill-revision.ts";
-// Imports review SKILL.md only; learned references are reviewed and hash-bound with it.
+// Per-bot Agent Skills: imports keep SKILL.md only and land disabled; learned skills may add reviewed references/<topic>.md files.
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -22,15 +21,18 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { z } from "zod";
 
-import { writeFileAtomic, writeFileAtomicIfChanged } from "./atomic.ts";
+import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { LEARN_SOURCE_PREFIX } from "./skill-learn.ts";
 import { libraryDescriptionsAt, librarySkillFilePath, listLibrarySkills, type LibrarySkillListing } from "./skill-library.ts";
+import { readManagedLinks, writeManagedLinks } from "./skill-link-registry.ts";
+import {
+  directoryEntryState, entryExistsWithoutFollowing, formatKb, isSkillReferencePath, learnedSkillDirectoryMatches, publishReviewedRevision,
+  readReferenceFiles, referenceLimitError, referencePathError, REFERENCES_ADVICE, skillReferencesSha256, STAGED_SKILL_FILE_MAX_BYTES,
+} from "./skill-storage.ts";
 import { workspaceDir } from "./workspace.ts";
-import { isSkillName, parseSkillMd, SKILL_FILE_MAX_BYTES } from "../shared/skill-md.ts";
-import { STAGED_SKILL_FILE_MAX_BYTES, isSkillReferencePath, skillReferencesSha256, formatKb, REFERENCES_ADVICE, directoryEntryState, preparedSkillFiles, preparedLearnedSkill, readReferenceFiles, learnedSkillDirectoryMatches, type PreparedSkillFiles } from "./skill-content.ts";
-export { STAGED_SKILL_FILE_MAX_BYTES, MAX_SKILL_REFERENCES, isSkillReferencePath, skillReferencesSha256, preparedLearnedSkill } from "./skill-content.ts";
+import { isSkillName, parseSkillMd, scanSkillText, SKILL_FILE_MAX_BYTES, type ParsedSkill } from "../shared/skill-md.ts";
 import { parseSkillCommand } from "../shared/skill-command.ts";
 
 export {
@@ -42,13 +44,13 @@ export {
   SKILL_NAME_MAX,
   type ParsedSkill,
 } from "../shared/skill-md.ts";
+export { STAGED_SKILL_FILE_MAX_BYTES, MAX_SKILL_REFERENCES, isSkillReferencePath, skillReferencesSha256 } from "./skill-storage.ts";
 
 export const INDEX_MAX_SKILLS = 30;
 export const INDEX_MAX_BYTES = 4_000;
 const loggedIndexOmissions = new Map<string, string>();
 export const MAX_STAGED_SKILLS = 20;
 export const STAGED_GIST_MAX = 240;
-
 interface SkillManifestEntry {
   description: string;
   enabled: boolean;
@@ -102,7 +104,6 @@ const skillManifestEntrySchema = z.object({
   }).optional(),
 });
 const skillManifestSchema = z.record(z.string(), skillManifestEntrySchema);
-const managedLinksSchema = z.array(z.string());
 
 function skillsDir(botId: string): string {
   return join(workspaceDir(botId), "skills");
@@ -150,15 +151,6 @@ function skillTarget(root: string, name: string, entry: SkillManifestEntry): str
     : join(root, "skills", name);
 }
 
-function entryExistsWithoutFollowing(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** Checks each app-created level without following symlinks before scanning or creating below it. */
 function nativeLinkDirectory(root: string, relative: string, create: boolean): string | null {
   const [family, leaf] = relative.split("/");
@@ -195,25 +187,6 @@ function skillStateDir(botId: string): string {
 
 function manifestPath(botId: string): string {
   return join(skillStateDir(botId), "skills.json");
-}
-
-function managedLinksPath(botId: string): string {
-  return join(skillStateDir(botId), "managed-links.json");
-}
-
-function readManagedLinks(botId: string): string[] {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(managedLinksPath(botId), "utf8"));
-    const result = managedLinksSchema.safeParse(parsed);
-    return result.success ? result.data.filter(isSkillName) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeManagedLinks(botId: string, names: string[]): void {
-  mkdirSync(skillStateDir(botId), { recursive: true, mode: 0o700 });
-  writeFileAtomicIfChanged(managedLinksPath(botId), `${JSON.stringify([...new Set(names)].sort(), null, 2)}\n`, { mode: 0o600 });
 }
 
 function manifestFromFile(path: string): SkillManifest | null {
@@ -359,12 +332,14 @@ const NATIVE_SKILL_DIRS = [".claude/skills", ".agents/skills", ".grok/skills"];
 function removeNativeLinksForUnsafeSkillsRoot(
   botId: string,
   root: string,
+  linkRoot: string,
+  threadId: string | undefined,
   previouslyManaged: string[],
   beforeRemove?: (link: string) => void,
 ): void {
   const retry = new Set<string>();
   for (const dir of NATIVE_SKILL_DIRS) {
-    const linkDir = nativeLinkDirectory(root, dir, false);
+    const linkDir = nativeLinkDirectory(linkRoot, dir, false);
     if (!linkDir) {
       for (const name of previouslyManaged) retry.add(name);
       continue;
@@ -391,7 +366,7 @@ function removeNativeLinksForUnsafeSkillsRoot(
     }
   }
   try {
-    writeManagedLinks(botId, [...retry]);
+    writeManagedLinks(botId, [...retry], threadId);
   } catch {
   }
 }
@@ -399,13 +374,14 @@ function removeNativeLinksForUnsafeSkillsRoot(
 /** Links, not copies; junctions on Windows, where directory symlinks need privileges. */
 export function syncSkillLinks(
   botId: string,
-  options: { beforeRemove?: (link: string) => void } = {},
+  options: { beforeRemove?: (link: string) => void; task?: { threadId: string; folder: string } } = {},
 ): void {
   const root = workspaceDir(botId);
-  const previouslyManaged = readManagedLinks(botId);
+  const linkRoot = options.task?.folder ?? root, threadId = options.task?.threadId;
+  const previouslyManaged = readManagedLinks(botId, threadId);
   // The bot can replace its skills root: never follow it, but still revoke existing app links.
   if (directoryEntryState(skillsDir(botId)) === "unsafe") {
-    removeNativeLinksForUnsafeSkillsRoot(botId, root, previouslyManaged, options.beforeRemove);
+    removeNativeLinksForUnsafeSkillsRoot(botId, root, linkRoot, threadId, previouslyManaged, options.beforeRemove);
     return;
   }
   const manifest = readManifest(botId);
@@ -415,7 +391,7 @@ export function syncSkillLinks(
   const desired = new Map(enabled.map(([name, entry]) => [name, skillTarget(root, name, entry)]));
   const managed = new Set<string>();
   for (const dir of NATIVE_SKILL_DIRS) {
-    const linkDir = nativeLinkDirectory(root, dir, enabled.length > 0);
+    const linkDir = nativeLinkDirectory(linkRoot, dir, enabled.length > 0);
     if (!linkDir) continue;
     let existing: string[] = [];
     try {
@@ -459,7 +435,7 @@ export function syncSkillLinks(
     }
   }
   try {
-    writeManagedLinks(botId, [...managed]);
+    writeManagedLinks(botId, [...managed], threadId);
   } catch {
   }
 }
@@ -676,7 +652,6 @@ export interface StagedSkillWrite {
   source: string;
   files: Array<{ path: string; content: string }>;
   sha256: string;
-  /** skillReferencesSha256 of the references/<topic>.md files in `files`. */
   referencesSha256?: string;
   warnings: string[];
   skippedFiles: string[];
@@ -746,8 +721,67 @@ function writeStaged(botId: string, store: StagedStore): void {
   writeFileAtomic(stagedPath(botId), `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
 }
 
-/** The reviewed references/<topic>.md files of an installed learned skill:
- * empty when it has none, null when they no longer match review. */
+interface PreparedSkillFiles {
+  files: Array<{ path: string; content: string }>;
+  parsed: ParsedSkill;
+  warnings: string[];
+  skippedFiles: string[];
+}
+
+function preparedSkillFiles(
+  files: Array<{ path: string; content: string }>,
+): PreparedSkillFiles | { error: string } {
+  const skillMd = files.find((file) => file.path === "SKILL.md" || file.path.endsWith("/SKILL.md"));
+  if (!skillMd) return { error: "no SKILL.md found at that location" };
+  if (Buffer.byteLength(skillMd.content, "utf8") > SKILL_FILE_MAX_BYTES) {
+    return { error: `SKILL.md is larger than ${SKILL_FILE_MAX_BYTES / 1024}KB` };
+  }
+  const parsed = parseSkillMd(skillMd.content);
+  if ("error" in parsed) return parsed;
+  const prefix = skillMd.path.slice(0, skillMd.path.length - "SKILL.md".length);
+  const skippedFiles = [
+    ...new Set(
+      files
+        .filter((file) => file !== skillMd)
+        .map((file) => {
+          const relative = file.path.startsWith(prefix) ? file.path.slice(prefix.length) : file.path;
+          return relative || file.path;
+        }),
+    ),
+  ];
+  const warnings = [
+    ...scanSkillText(skillMd.content),
+    ...skippedFiles.map((path) => `skipped supporting file "${path}" — v1 imports only SKILL.md`),
+  ];
+  return { files: [{ path: "SKILL.md", content: skillMd.content }], parsed, warnings, skippedFiles };
+}
+
+export function preparedLearnedSkill(
+  files: Array<{ path: string; content: string }>,
+): PreparedSkillFiles | { error: string } {
+  const skillMds = files.filter((file) => file.path === "SKILL.md");
+  if (skillMds.length !== 1 || files.some((file) => file.path !== "SKILL.md" && file.path.endsWith("SKILL.md"))) {
+    return { error: "learned skills must contain exactly one SKILL.md" };
+  }
+  const limitError = referenceLimitError(files);
+  if (limitError) return { error: limitError };
+  const prepared = preparedSkillFiles([skillMds[0]!]);
+  if ("error" in prepared) return prepared;
+  const references = files
+    .filter((file) => file.path !== "SKILL.md")
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+    .map((file) => ({ path: file.path, content: file.content }));
+  return {
+    ...prepared,
+    files: [prepared.files[0]!, ...references],
+    warnings: [
+      ...prepared.warnings,
+      ...references.flatMap((file) => scanSkillText(file.content).map((warning) => `${file.path}: ${warning}`)),
+    ],
+  };
+}
+
+/** Empty when the skill has no references; null when they no longer match review. */
 export function readSkillReferences(botId: string, name: string): Array<{ path: string; content: string }> | null {
   if (!isSkillName(name)) return null;
   const entry = readManifest(botId)[name];
@@ -908,7 +942,9 @@ function updatePreparedSkill(
     return { error: "the installed skill changed after this update was proposed — review a fresh update" };
   }
   try {
-    const storageRevision = publishReviewedRevision(skillStateDir(botId), () => ensureSkillsRoot(botId), options.appliedStageId, prepared.files, sha256, referencesSha256);
+    const dirs = { state: skillStateDir(botId), ensureSkillsRoot: () => ensureSkillsRoot(botId) };
+    const storageRevision = publishReviewedRevision(dirs, options.appliedStageId, prepared.files, sha256, referencesSha256);
+    // Re-read just before the swap: keeps unrelated manifest changes and the user's latest enabled choice.
     const latestManifest = readManifest(botId);
     const latest = latestManifest[name];
     if (
@@ -952,13 +988,11 @@ export function stageSkillWrite(
   input: {
     action: StagedSkillAction;
     targetName?: string;
-    /** SKILL.md, plus any references/<topic>.md files to add or replace.
-     * A reference with empty content removes that file. */
+    /** A reference with empty content removes that file. */
     files: Array<{ path: string; content: string }>;
     gist?: string;
     source?: string;
-    /** Updates keep the installed references the write does not mention
-     * (default). Undo passes false to restore an exact earlier file set. */
+    /** False replaces the whole reference set; by default an update keeps references it does not mention. */
     keepReferences?: boolean;
   },
 ): StagedSkillWrite | { error: string } {
@@ -983,11 +1017,7 @@ export function stageSkillWrite(
   const removals = new Set(
     redactedFiles.filter((file) => file.path !== "SKILL.md" && !file.content.trim()).map((file) => file.path),
   );
-  for (const path of removals) {
-    if (!isSkillReferencePath(path)) {
-      return { error: `learned skill files must be SKILL.md or references/<topic>.md (lowercase letters, digits, and hyphens), not "${path}"` };
-    }
-  }
+  for (const path of removals) if (!isSkillReferencePath(path)) return { error: referencePathError(path) };
   if (removals.size && input.action !== "update") {
     return { error: `empty reference content removes a file only on update; give ${[...removals][0]} its content` };
   }
@@ -1114,7 +1144,7 @@ export function applyStagedSkillWrite(
   id: string,
   options: {
     expectedSha256?: string;
-    /** The references hash the reviewer saw; null means none. Omitted: not checked. */
+    /** Null: the reviewer saw no references. Omitted: not checked. */
     expectedReferencesSha256?: string | null;
     onApplied?: (skill: SkillListing) => void;
   } = {},

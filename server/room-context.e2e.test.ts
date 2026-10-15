@@ -82,8 +82,7 @@ it("drops a member's reading once another member's turn replaces its warm proces
 
     await send("@Editor Cut the intro.");
     await expect.poll(async () => (await read()).memberContext?.[first.id]?.tokens, { timeout: 5_000 }).toBe(CONTEXT_TOKENS);
-    // Cutter shares the room's thread on the same engine: Editor's process
-    // is closed for Cutter's, so Editor's warning goes with it.
+    // Cutter shares the room's thread and engine, so the driver closes Editor's warm process.
     await send("@Cutter Trim the middle.");
     await expect.poll(async () => Object.keys((await read()).memberContext ?? {}), { timeout: 5_000 }).toEqual([second.id]);
     await send("@Editor Tighten the outro.");

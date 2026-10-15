@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, renameSync } from "node:fs";
 import { z } from "zod";
 
-import { learnedSkillDirectoryMatches, readReferenceFiles, referenceLimitError, skillReferencesSha256 } from "./skill-content.ts";
+import { learnedSkillDirectoryMatches, readReferenceFiles, referenceLimitError, skillReferencesSha256 } from "./skill-storage.ts";
 import { writeLibraryFiles } from "./skill-library-files.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR, type AppConfig } from "./config.ts";
@@ -153,21 +153,13 @@ export interface SkillLibraryEntry {
   warnings: string[];
   skippedFiles: string[];
   package?: SkillPackageStamp;
-  /** Descriptions this skill had before, oldest first, each with the time
-   * (ms) an update replaced it. A running conversation keeps the description
-   * it started with (libraryDescriptionsAt), so a shared update never changes
-   * its system prompt. */
+  /** Replaced descriptions, oldest first, with when each was replaced, so a running conversation keeps its prompt. */
   descriptionHistory?: Array<{ description: string; until: number }>;
 }
 
-/** How long a replaced description is kept. Pruned by age, never by count,
- * so every conversation that started within this window keeps exactly the
- * description it began with. An older one may see a later description once;
- * the provider's prompt cache (an hour at most) is long gone by then. */
+/** Pruned by age, never by count: providers keep a prompt cache an hour at most. */
 export const DESCRIPTION_HISTORY_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** The descriptions a conversation started at `startedAt` lists, by skill
- * name: the one in effect then, or `current` when nothing changed since. */
 export function libraryDescriptionsAt(startedAt: number | undefined, root: string = skillsLibraryRoot()): (name: string, current: string) => string {
   if (startedAt === undefined) return (_name, current) => current;
   const index = readSkillLibraryIndex(root);
@@ -401,11 +393,7 @@ export function setLibrarySkillReviewState(
   return librarySkillListing(root, entry);
 }
 
-/** Replace a library skill's SKILL.md in place (features.shareLearnedSkills:
- * a shared learned skill updated by a bot it is assigned to, or an Undo
- * putting the previous version back). Applied only while the stored bytes
- * still match `expectSha256` — the reviewed version the writer read —
- * otherwise `stale` and nothing changes. The review state is kept. */
+/** Applied only while the stored bytes still match `expectSha256`; otherwise `stale` and nothing changes. */
 export function updateLibrarySkill(input: {
   name: string;
   instructions: string;
@@ -463,10 +451,7 @@ export function updateLibrarySkill(input: {
   return librarySkillListing(root, next);
 }
 
-/** Take a skill out of the library (Undo of a shared learned skill that
- * this share created). The bytes move to the write-once archive first,
- * never deleted; then the index entry goes. A failed move changes nothing
- * and returns the error; a failed index write moves the bytes back. */
+/** Bytes move to the write-once archive before the index entry goes; they are never deleted. */
 export function retireLibrarySkill(
   name: string,
   expectSha256: string,
@@ -496,8 +481,7 @@ export function retireLibrarySkill(
     try {
       renameSync(destination, directory);
     } catch {
-      // The index still lists the skill; its bytes read "changed after
-      // review" until a person restores them from the archive.
+      // The index still lists the skill, which reads "changed after review" until restored from the archive.
     }
     return { error: `could not update the skills library index: ${error instanceof Error ? error.message : String(error)}` };
   }

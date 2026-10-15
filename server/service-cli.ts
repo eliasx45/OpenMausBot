@@ -16,12 +16,14 @@ export interface ServiceInstallInput {
   tunnel?: boolean;
   tailscale?: boolean;
   label?: string;
-    sentinel?: boolean;
-    sentinelOut?: string;
+  sentinel?: boolean;
+  /** Defaults to the platform's Sentinel folder. */
+  sentinelOut?: string;
   env?: NodeJS.ProcessEnv;
-    exists?: (path: string) => boolean;
+  exists?: (path: string) => boolean;
+  /** Whether a bundled CLI knows the sentinel command. */
   hasSentinel?: (script: string) => boolean;
-    script: string;
+  script: string;
   node: string;
   platform?: NodeJS.Platform;
   home?: string;
@@ -85,8 +87,6 @@ export function runServiceCommand(input: ServiceInstallInput, io: ServiceIo): nu
   return 0;
 }
 
-/** An app released before Sentinel bundles a CLI without it; its usage text
- * names --check-install from the first release that has it. */
 function bundleHasSentinel(script: string): boolean {
   try {
     return readFileSync(script, "utf8").includes("--check-install");
@@ -111,15 +111,11 @@ function runSentinelService(input: ServiceInstallInput, platform: NodeJS.Platfor
     for (const line of plan.deactivate) io.log(`  ${line}`);
     return 0;
   }
-  // the scan would refuse this folder on every run (XDG_STATE_HOME inside
-  // the data dir, a link into a repository); say so now, before writing
   const refusal = outRefusal(out, input.dataDir);
   if (refusal) {
     io.error(refusal);
     return 1;
   }
-  // the installed app's own CLI survives app updates and Node upgrades;
-  // this process's node and script may be a checkout or an nvm install
   const shipped = shippedSentinelCli(platform, home, input.exists ?? existsSync, input.hasSentinel ?? bundleHasSentinel);
   if (!shipped) {
     const warning = unstableInstallWarning(input.script);
@@ -138,12 +134,10 @@ function runSentinelService(input: ServiceInstallInput, platform: NodeJS.Platfor
       ? { [plan.files[0]!.name]: sentinelLaunchdPlist(spec) }
       : { [plan.files[0]!.name]: sentinelSystemdService(spec), [plan.files[1]!.name]: sentinelSystemdTimer() };
   } catch (error) {
-    // a path no service file can hold: nothing is written
     io.error(error instanceof Error ? error.message : String(error));
     return 1;
   }
-  // Sentinel's folder, outside the data dir; launchd opens the log in it
-  // itself and will not create the folder
+  // launchd opens the log itself and will not create its folder
   mkdirSync(out, { recursive: true, mode: 0o700 });
   for (const file of plan.files) {
     writeFileSync(join(out, file.name), rendered[file.name]!, { mode: 0o644 });

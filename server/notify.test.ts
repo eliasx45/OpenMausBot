@@ -45,10 +45,8 @@ describe("buildNotification", () => {
       title: "Scout in Launch mentioned you",
       body: "@you three open questions are blocking Section 2",
     });
-    // on by default, off when the bot's notifications are off
     expect(buildNotification("mention", { ...bot, notifications: undefined }, "room-thread", "@you", { group })).not.toBeNull();
     expect(buildNotification("mention", { ...bot, notifications: false }, "room-thread", "@you", { group })).toBeNull();
-    // and never an empty banner
     expect(buildNotification("mention", bot, "room-thread", "   ", { group })).toBeNull();
   });
 

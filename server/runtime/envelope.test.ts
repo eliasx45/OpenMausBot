@@ -59,7 +59,6 @@ describe("composeEnvelope: assignment with person lineage", () => {
 
   it("tells a bot's assignee to ask its requester by ending the turn, never with coordinate_bots", () => {
     expect(envelope).toContain("Ask @Chief or anyone above it by ending your turn with the question, never coordinate_bots.");
-    // a person or a one-way notice has no bot turn to send work back to
     expect(composeEnvelope(assignment({ requester: { kind: "person" } }), names)).not.toContain("never coordinate_bots");
     expect(composeEnvelope(assignment({ reply: "none", mode: "notify" }), names)).not.toContain("never coordinate_bots");
   });

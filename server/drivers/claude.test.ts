@@ -16,8 +16,6 @@ import {
   claudeCliSupports,
   claudeCliUpdate,
   claudeHookSettings,
-  CLAUDE_BASH_MAX_TIMEOUT_MS,
-  claudeLimitMessage,
   ClaudeDriver,
   createPermissionBroker,
   hookTokenFile,
@@ -31,8 +29,11 @@ import {
   turnCostFromRunningTotal,
   type ClaudeConfig,
 } from "./claude.ts";
+import { TEAM_TOOLS_FAILED } from "./team-tools.ts";
+import { claudeLimitMessage } from "./claude-limits.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { rebuiltSessionNotice } from "../resume-recovery.ts";
+import { BASH_MAX_TIMEOUT_MS } from "../system-prompt.ts";
 import { ephemeralWorkspaceTokenPath } from "../workspace-backup-policy.ts";
 import * as procs from "../procs.ts";
 import * as localInject from "./local-inject.ts";
@@ -459,6 +460,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(JSON.parse(seen.mcpConfig.mcpServers.agents.env.OMB_GATE_TOOL_SCOPE)).toEqual({ allow: ["native:*", "mcp:agents:list_bots"] });
   });
 
+  it("keeps a bot's tool selection working with the person's own skills", async () => {
+    const dump = join(scratch, "scope-user-skills.json"); process.env.FAKE_CLAUDE_DUMP = dump;
+    await create();
+    await instance.adapter.sendTurn({ threadId: "scope-user-skills", text: "Fixture", userSkillsDir: join(scratch, "claude-user-skills"), toolScope: { allow: ["native:*"] } });
+    await recorder.until((event) => event.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).argv).toContain("--add-dir");
+  });
+
   it("refuses native MCP inheritance when a bot has an explicit selection", async () => {
     const dump = join(scratch, "scope-inherited-mcp.json"); process.env.FAKE_CLAUDE_DUMP = dump;
     await create();
@@ -571,6 +580,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
   });
 
   it("turns a signed-out CLI into a setup error, not a bot reply", async () => {
+    const dump = join(scratch, "signed-out-session.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
     await create("not-logged-in");
     await instance.adapter.sendTurn({ threadId: "t-auth", text: "hi" });
     await recorder.until((e) => e.type === "turn.completed");
@@ -580,6 +591,10 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.some((e: any) => e.type === "item.completed" && e.itemType === "assistant_text")).toBe(false);
     expect(recorder.events.some((e: any) => e.type === "content.delta")).toBe(false);
     expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: false, stopReason: "auth_required" });
+    const pid = dumpedPid(dump);
+    await expect.poll(() => {
+      try { process.kill(pid, 0); return false; } catch { return true; }
+    }, { timeout: 7_000 }).toBe(true);
   });
 
   it("settles an outdated CLI as update_required without emitting an assistant reply", async () => {
@@ -1400,6 +1415,21 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.argv[seen.argv.indexOf("--setting-sources") + 1]).toBe("project");
   });
 
+  it("adds the person's own skills folder when the turn asks, keeping everything else isolated", async () => {
+    await create();
+    const dump = join(scratch, "user-skills.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const skills = join(scratch, "claude-user-skills");
+
+    await instance.adapter.sendTurn({ threadId: "t-user-skills", text: "hi", userSkillsDir: skills });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--add-dir") + 1]).toBe(skills);
+    expect(seen.argv).toContain("--strict-mcp-config");
+    expect(seen.argv[seen.argv.indexOf("--setting-sources") + 1]).toBe("project");
+  });
+
   it("mounts a url server in the CLI's own shape, header values in the private file", async () => {
     await create();
     const dump = join(scratch, "remote-mcp.json");
@@ -1789,7 +1819,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await create(undefined, { FAKE_CLAUDE_DUMP: dump });
     await instance.adapter.sendTurn({ threadId: "t-bash-timeout", text: "hi" });
     await recorder.until((e) => e.type === "turn.completed");
-    expect(JSON.parse(readFileSync(dump, "utf8")).env.BASH_MAX_TIMEOUT_MS).toBe(String(CLAUDE_BASH_MAX_TIMEOUT_MS));
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.BASH_MAX_TIMEOUT_MS).toBe(String(BASH_MAX_TIMEOUT_MS));
 
     recorder.stop();
     await instance.dispose();
@@ -2614,6 +2644,19 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
   });
 
+  it("says when its team tools did not start, and starts the next turn in a new process that reconnects them", async () => {
+    await create(undefined, { FAKE_CLAUDE_MCP_FAILED: "agents" });
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const first = await instance.adapter.sendTurn({ threadId: "t-team-tools", text: "one" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+    expect(recorder.events.filter((e) => e.type === "runtime.notice").map((e) => (e as { message: string }).message)).toEqual([TEAM_TOOLS_FAILED]);
+    const failedLaunch = dumpedPid(dump);
+    const second = await instance.adapter.sendTurn({ threadId: "t-team-tools", text: "two" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    expect(dumpedPid(dump)).not.toBe(failedLaunch);
+  });
+
   it("books each turn of a retained process at its own cost, not the process's running total", async () => {
     await create();
     const dump = join(scratch, "dump.json");
@@ -3423,7 +3466,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
   });
 
   it("runs helper calls tool-free and isolated, in an empty folder it then removes", async () => {
-    await create();
+    await create(undefined, { FAKE_CLAUDE_VERSION: "2.1.296" });
     const dump = join(scratch, "isolated-helper.json");
     process.env.FAKE_CLAUDE_DUMP = dump;
     await expect(instance.generateText!("summarize")).resolves.toBe("fake generated text");
@@ -3434,6 +3477,16 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(seen.argv).toContain("--no-session-persistence");
     expect(seen.cwd).toContain("omb-claude-background-");
     expect(existsSync(seen.cwd)).toBe(false);
+  });
+
+  it("reads the CLI version before a helper call, so an older CLI gets no --tools", async () => {
+    await create(undefined, { FAKE_CLAUDE_VERSION: "2.1.250" });
+    const dump = join(scratch, "older-helper.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await expect(instance.generateText!("summarize")).resolves.toBe("fake generated text");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).not.toContain("--tools");
+    expect(seen.argv).toContain("--strict-mcp-config");
   });
 
   it("waits as long as the caller says for a helper call, and no longer", async () => {
@@ -3519,6 +3572,23 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const onUsage = vi.fn();
     await expect(instance.generateText!("summarize", { onUsage })).rejects.toThrow("synthetic billed failure");
     expect(onUsage.mock.calls).toEqual([[{ model: "claude-haiku-4-5", input: undefined, output: undefined, cachedInput: undefined, costUsd: 0.01 }]]);
+  });
+
+  it("writes a one-shot with the model a caller names, while permission review keeps its own", async () => {
+    await create();
+    const dump = join(scratch, "named-model.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const model = () => {
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      return seen.argv[seen.argv.indexOf("--model") + 1];
+    };
+    await expect(instance.generateText!("summarize", { model: "claude-haiku-5-5" })).resolves.toBe("fake generated text");
+    expect(model()).toBe("claude-haiku-5-5");
+    await expect(instance.generateText!("summarize")).resolves.toBe("fake generated text");
+    expect(model()).toBe("claude-haiku-4-5");
+    // the contract gives permission review no way to name a model
+    await expect(instance.reviewPermission!("review this request")).resolves.toBe("fake generated text");
+    expect(model()).toBe("claude-haiku-4-5");
   });
 
   it.each(["not JSON", '{"type":"assistant"}'])("rejects malformed one-shot output without invented usage (%s)", async result => {

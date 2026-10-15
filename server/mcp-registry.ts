@@ -5,8 +5,7 @@ import type { McpServerSpec, RemoteMcpSpec, StdioMcpSpec } from "./contracts.ts"
 /** One config.json `mcpServers` entry: the block Claude Code, Cursor and Claude Desktop write. */
 export interface StoredStdioMcpServer extends StdioMcpSpec {
   enabled: boolean;
-  /** Characters of one tool result allowed into a model's context; 0 = never
-   * trim. Absent = the app default (OMB_MCP_RESULT_BUDGET, else 8,000). */
+  /** Characters of one tool result allowed into context; 0 = never trim, absent = OMB_MCP_RESULT_BUDGET, else 8,000. */
   resultBudget?: number;
 }
 /** An app pre-registered with the server's authorization server; its secret is a credential, never listed. */
@@ -18,7 +17,6 @@ export interface McpOAuthClientConfig {
 export interface StoredRemoteMcpServer extends RemoteMcpSpec {
   enabled: boolean;
   oauth?: McpOAuthClientConfig;
-  /** as on StoredStdioMcpServer */
   resultBudget?: number;
 }
 export type StoredMcpServer = StoredStdioMcpServer | StoredRemoteMcpServer;
@@ -39,7 +37,7 @@ export interface RemoteMcpServerListing {
   headerKeys: string[];
   enabled: boolean;
   resultBudget?: number;
-    oauth?: { clientId: string; scopes: string[]; clientSecretConfigured: boolean };
+  oauth?: { clientId: string; scopes: string[]; clientSecretConfigured: boolean };
 }
 export type McpServerListing = StdioMcpServerListing | RemoteMcpServerListing;
 
@@ -51,8 +49,7 @@ export const MAX_MCP_SERVERS = 20;
 const MAX_ARGS = 64;
 const MAX_ENV = 64;
 const MAX_HEADERS = 32;
-/** The largest per-server result budget: 2,000,000 characters is ~500k
- * tokens, more than any model's context, so anything above it means "never". */
+/** ~500k tokens, more than any model's context. */
 export const MAX_RESULT_BUDGET = 2_000_000;
 
 const resultBudgetSchema = z.number({ message: "The result size limit must be a whole number of characters." })
@@ -69,10 +66,18 @@ export function isHarnessOwnedMcpEnvName(name: string): boolean {
   return name === "ELECTRON_RUN_AS_NODE" || name.startsWith("OMB_") || name.startsWith("OGB_");
 }
 
-function environmentNameError(name: string): string | null {
+/** Codex shares one environment across MCP children: OMB_/OGB_ carry bearers, and ELECTRON_RUN_AS_NODE may only repeat the "1" the harness proxies need. */
+export function isReservedMcpEnvEntry(name: string, value: string): boolean {
+  if (name === "ELECTRON_RUN_AS_NODE") return value !== "1";
+  return isHarnessOwnedMcpEnvName(name);
+}
+
+function environmentEntryError(name: string, value: string): string | null {
   if (!ENV_NAME.test(name)) return `Environment variable “${name}” is not valid.`;
-  if (isHarnessOwnedMcpEnvName(name)) {
-    return `Environment variable “${name}” is reserved by OpenMausBot.`;
+  if (isReservedMcpEnvEntry(name, value)) {
+    return name === "ELECTRON_RUN_AS_NODE"
+      ? `Environment variable “${name}” is reserved by OpenMausBot; a custom server may set it to “1” only.`
+      : `Environment variable “${name}” is reserved by OpenMausBot.`;
   }
   return null;
 }
@@ -211,13 +216,14 @@ function parseStdio(raw: unknown, mutation: boolean, existing?: StoredMcpServer)
     return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid MCP server." };
   }
   const incoming = parsed.data.env ?? {};
-  const invalidEnv = Object.keys(incoming).map(environmentNameError).find((error) => error !== null);
-  if (invalidEnv) return { ok: false, error: invalidEnv };
   if (Object.keys(incoming).length > MAX_ENV) {
     return { ok: false, error: `Use at most ${MAX_ENV} environment variables.` };
   }
   const env = resolveSecrets(incoming, existing && !isRemoteMcpServer(existing) ? existing.env : undefined);
   if (!env.ok) return env;
+  // Checked after resolving, so a kept write-only value is judged by what would run.
+  const invalidEnv = Object.entries(env.values).map(([name, value]) => environmentEntryError(name, value)).find((error) => error !== null);
+  if (invalidEnv) return { ok: false, error: invalidEnv };
   return {
     ok: true,
     server: {

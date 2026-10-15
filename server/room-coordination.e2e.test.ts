@@ -495,7 +495,6 @@ it.each([
     .evidence.find((entry: any) => entry.step).response.result.content[0].text;
   if (hidden) expect(refused).toBe(`The bot with id "${botId}" is no longer available — call list_bots for the ones you can reach`);
   else {
-    // the refusal names who the caller can reach, with the ids to copy
     expect(refused.startsWith(`No bot with id or name "${botId}" — call list_bots and copy the exact id from the result. You can reach: `)).toBe(true);
     expect(refused).toContain(`${f.target.name} (id ${f.target.id})`);
     expect(refused).toContain(` ${PEER_ACCESS_HELP}`);

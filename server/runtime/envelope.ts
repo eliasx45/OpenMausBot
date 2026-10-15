@@ -67,8 +67,6 @@ function askLine(a: Assignment, person: string): string {
 function replyLine(a: Assignment, requester: string): string {
   const close = a.mode === "consult" ? "" : "; end it with what you did and what stays unverified";
   if (a.reply === "resume") {
-    // coordinate_bots toward the requester or its ancestors is refused
-    // (runtime admit): a bot asks its requester by ending its turn.
     const ask = a.requester.kind === "bot_turn"
       ? ` Ask ${requester} or anyone above it by ending your turn with the question, never coordinate_bots.`
       : "";

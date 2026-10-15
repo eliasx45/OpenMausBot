@@ -8,6 +8,7 @@ import type { CommandAllowlistCandidate } from "./command-allowlist.ts";
 import type { TurnDigest } from "./digest.ts";
 import type { BotAvatarCrop } from "./bot-avatar.ts";
 import type { MascotBodyId } from "./mascot-bodies.ts";
+import type { ReplyStyle } from "./reply-style.ts";
 import type { CredentialTargetId } from "./credential-request.ts";
 import type { TeamSetupRequest } from "./team-setup.ts";
 import type { RoutineRequestCardData } from "./routine-request.ts";
@@ -20,7 +21,7 @@ import type { RoutineRunCardData } from "./routine-run.ts";
 import type { WidgetPayload } from "./widget.ts";
 import type { GroupGoalRunCardData } from "./group-goal-run.ts";
 import type { RuntimeEvent } from "./runtime-events.ts";
-import type { Notification } from "./notification.ts";
+import type { NotificationLogEntry } from "./notification.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 import type { WebhookAttempt, WebhookTrigger } from "./webhooks.ts";
 
@@ -74,8 +75,7 @@ export interface TaskOpenedBy {
   /** The opener's own conversation this "work" thread was opened from.
    * Everything that conversation later sends this bot continues here. */
   threadId?: string;
-  /** A parallel room job's thread: `threadId` is the room thread it was
-   * sent from, and the member must stay in that room (server/host/room-jobs.ts). */
+  /** A parallel room job's thread: `threadId` is the room thread it came from, and the member must stay in that room. */
   roomLane?: true;
   at: number;
 }
@@ -134,6 +134,7 @@ export interface WireTask {
   /** Epoch ms of the newest message, or createdAt when the thread has none.
    * Server-derived. Clients must not write it. */
   updatedAt?: number;
+  lastThreadOrderAt?: number;
   /** 0 means "until new activity"; a future epoch ms means "until then", and
    * an expired value reads as absent. Absent = not snoozed. */
   snoozedUntil?: number;
@@ -234,6 +235,9 @@ export const CONNECTOR_SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,80}$/;
 /** Composio tool names are upper-snake, e.g. `GMAIL_SEND_EMAIL`. */
 export const CONNECTOR_TOOL_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 
+/** Fails closed: only an absent switch or a strict true allows the helper model; a hand-edited "false" or 0 reads as never. */
+export const helperModelAllowed = (bot: { helperModel?: unknown }): boolean => bot.helperModel === undefined || bot.helperModel === true;
+
 /** A bot as a client may see it. avatarUrl is always present (null when the
  * bot has none). */
 export interface WireBot {
@@ -292,6 +296,8 @@ export interface WireBot {
   alwaysAllow?: string[];
   /** Speak this bot's replies aloud as they settle, without being asked. */
   speakReplies?: boolean;
+  /** How replies are shaped. Absent = "default". */
+  replyStyle?: ReplyStyle;
   /** This bot's own voice id, so a room of bots doesn't sound like one person. */
   voice?: string;
   /** Whether this bot may send voice notes. Absent/true = allowed; false
@@ -339,6 +345,8 @@ export interface WireBot {
   /** Prompt-cache keep-warm for this bot's Claude threads: true or false
    * overrides the workspace setting; absent follows it. */
   cacheKeepWarm?: boolean;
+  /** false: the workspace's helper model never writes this bot's background texts. Absent or true: allowed. */
+  helperModel?: boolean;
   /** Which of the app-wide MCP servers this bot mounts, by name. */
   mcpServers?: string[];
   /** Owner-selected original tool identities. An empty allowlist permits none. */
@@ -472,6 +480,7 @@ export interface WireMessage {
   requestPending?: boolean;
   /** The last assistant text item from a settled provider turn. */
   turnTerminal?: boolean;
+  turnCompletedAt?: number;
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
@@ -492,10 +501,12 @@ export interface WireMessage {
    * with how sure it was. Absent on every other message; clients that do
    * not know it ignore it. */
   routedBy?: { provider: "jev" | "openrouter"; probability: number };
+  /** On a conversational bot's user line: the picker label of the quick model its reply ran on. */
+  quickModel?: string;
   /** Set on the user-role line another bot delivered into this bot's own
    * conversation (coordinate_bots, start_thread). `incident`: the line is a
-   * Team incidents report about that bot's broken run in `threadId`, not its
-   * words; `notified`: that failure already buzzed the person. */
+   * Team incidents report or Team escalations notice about that bot's thread
+   * in `threadId`, not its words; `notified`: the person was already buzzed. */
   peerAsk?: { botId: string; name: string; unattended?: boolean; incident?: { threadId: string; notified?: boolean } };
   /** emoji reactions; by = "user" or a member botId. */
   reactions?: Array<{ emoji: string; by: string }>;
@@ -513,6 +524,9 @@ export interface WireMessage {
   /** steer-queue entry this drained user line came from. */
   queueId?: string;
 }
+
+export const movesThreadToTop = (message: Pick<WireMessage, "role" | "kind" | "peerAsk" | "turnId" | "turnTerminal">): boolean =>
+  message.role === "user" ? !message.peerAsk : message.kind === "text" && (message.turnTerminal === true || !message.turnId);
 
 export interface OptionCardData {
   /** calls: one per outbound call the card covers, in subtitle order. */
@@ -567,6 +581,17 @@ export interface OptionCardData {
   skillRequest?: SkillRequestCardData;
   /** A provider's structured question set. */
   questionRequest?: QuestionRequestCardData;
+  /** The options are the whole answer: clients offer no free-text reply. */
+  fixedOptions?: boolean;
+  quotaSwitch?: QuotaSwitchCardData;
+}
+
+/** Kept on the card so the offer survives a restart. `engines` follow the card's options; `messageId` is the
+ * message to resend, `rootId` the failed request's job-runtime root. */
+export interface QuotaSwitchCardData {
+  engines: Array<{ instanceId: string; name: string }>;
+  messageId?: string;
+  rootId?: string;
 }
 
 /** Which app holds the microphone of a Live call: the desktop app (its own
@@ -722,6 +747,7 @@ export interface GroupTask {
   turnTimeoutMinutes?: number;
   /** Epoch ms of the newest message, or createdAt when the thread has none. */
   updatedAt?: number;
+  lastThreadOrderAt?: number;
   /** The first message already drove a title attempt for this thread, so a
    * later one does not rename a room the person may have retitled. */
   titleFromFirstMessage?: true;
@@ -784,26 +810,19 @@ export interface WireGroup {
   /** Room messages addressed to a member while it was held, by bot id;
    * its next turn is shown them, then they are cleared. */
   heldMessages?: Record<string, RoomHeldMessage[]>;
-  /** transient: who waits in each of the room's threads, and on whom
-   * (server/room-queue.ts). Same-room speakers take turns; absent or empty
-   * when no thread has anyone waiting. */
+  /** transient: who waits in each of the room's threads, and on whom; absent or empty when nobody waits. */
   queue?: RoomQueueEntry[];
 }
 
-/** One member's place in a room thread's line of work: "Queued · waiting
- * for Ada (2 of 5)". */
 export interface RoomQueueEntry {
   botId: string;
-  /** The room thread whose line this is. */
   threadId: string;
   state: "running" | "queued";
   /** 1-based place in that thread's line; `of` counts the whole line. */
   position: number;
   of: number;
-  /** Who a queued member waits on: the member running now, else the one
-   * speaking (or the one ahead). */
+  /** Who a queued member waits on: the member running now, else the one speaking (or the one ahead). */
   waitingForBotId?: string;
-  /** The assignment, for work handed out with coordinate_bots. */
   assignmentId?: string;
 }
 
@@ -858,7 +877,7 @@ export type ServerFrame =
   | { kind: "thread"; threadId: string; activeLeafId: string }
   | { kind: "bot"; bot: WireBot }
   | { kind: "group"; group: WireGroup }
-  | { kind: "notify"; notification: Notification }
+  | { kind: "notify"; notification: NotificationLogEntry }
   | { kind: "group.deleted"; groupId: string }
   | { kind: "routine"; routine: Routine }
   | { kind: "routine.deleted"; routineId: string }

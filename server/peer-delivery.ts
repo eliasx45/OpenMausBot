@@ -12,8 +12,7 @@ export interface PeerDeliveryReceipt {
   taskId?: string;
   requestId?: string;
   threadId?: string;
-  /** Its place in a room's line, when room jobs run one at a time there
-   * (server/room-queue.ts): "2 of 5, after Ada". */
+  /** Its place in a room's line when room jobs there run one at a time. */
   queue?: { position: number; of: number; waitingFor?: string };
 }
 

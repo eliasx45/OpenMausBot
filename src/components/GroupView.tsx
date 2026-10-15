@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { activeLocale, t } from "@/lib/i18n";
 import { useShowThreads } from "@/lib/thread-preferences";
-import { ArrowDown, Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, Pause, Pin, Plus, Search, Square, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, Pause, Pin, Plus, Search, Square, X } from "lucide-react";
 import {
   api,
   useStore,
@@ -90,6 +90,8 @@ import { TranscriptAnnouncer } from "./TranscriptAnnouncer";
 import { dayLabel, localDay } from "@/lib/transcript-derivations";
 import { roomSpeakerIds, roomThreadSpeakerId, roomThreadWorking } from "@/lib/room-threads";
 import { RoomQueueList, RoutedByLine, roomMemberQueueTitle } from "./RoomQueueList";
+import { JumpToLatestButton } from "./JumpToLatestButton";
+import { Select } from "./Select";
 
 export function RoomToolChip({ message, roomId }: { message: Message; roomId?: string }) {
   const { state, dispatch } = useStore();
@@ -238,7 +240,7 @@ function RoomTextMessage({
         <div
           data-chat-bubble
           className={cn(
-            "w-fit max-w-[min(42rem,78%)] rounded-2xl text-[15px] leading-relaxed",
+            "w-fit max-w-[min(var(--chat-bubble-max),var(--chat-bubble-pct))] rounded-2xl text-[15px] leading-relaxed",
             !user && emerging && "turn-answer",
             !user && !m.text?.trim() && !m.replyToId && m.attachments?.length
               ? "text-ink"
@@ -598,32 +600,28 @@ export function DefaultResponderSelect({ group, members }: { group: Group; membe
   };
 
   return (
-    <div className="relative shrink-0" title={title}>
-      <select
-        aria-label={t("room.responder.aria")}
-        value={value}
-        onChange={(event) => change(event.target.value)}
-        className="h-8 max-w-[190px] appearance-none truncate rounded-full border border-hairline/40 bg-raised/60 py-1 pl-3 pr-7 text-[12.5px] font-medium text-ink outline-none hover:bg-raised focus:border-accent"
-      >
-        <optgroup label={t("room.responder.groupLead")}>
-          {members.map((member) => (
-            <option key={member.id} value={`member:${member.id}`}>
-              {t("room.responder.leadOption", { name: member.name })}
-            </option>
-          ))}
-        </optgroup>
-        <optgroup label={t("room.responder.groupBehavior")}>
-          <option value="auto">{jevOn ? t("room.responder.autoOption") : t("room.responder.autoOptionOff")}</option>
-          <option value="everyone">{t("room.responder.everyoneOption")}</option>
-          <option value="mentions">{t("room.responder.mentionsOption")}</option>
-        </optgroup>
-      </select>
-      <ChevronDown
-        size={13}
-        aria-hidden="true"
-        className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-secondary"
-      />
-    </div>
+    <Select
+      variant="pill"
+      size="sm"
+      className="shrink-0 max-w-[190px]"
+      title={title}
+      aria-label={t("room.responder.aria")}
+      value={value}
+      onChange={(event) => change(event.target.value)}
+    >
+      <optgroup label={t("room.responder.groupLead")}>
+        {members.map((member) => (
+          <option key={member.id} value={`member:${member.id}`}>
+            {t("room.responder.leadOption", { name: member.name })}
+          </option>
+        ))}
+      </optgroup>
+      <optgroup label={t("room.responder.groupBehavior")}>
+        <option value="auto">{jevOn ? t("room.responder.autoOption") : t("room.responder.autoOptionOff")}</option>
+        <option value="everyone">{t("room.responder.everyoneOption")}</option>
+        <option value="mentions">{t("room.responder.mentionsOption")}</option>
+      </optgroup>
+    </Select>
   );
 }
 
@@ -1571,7 +1569,6 @@ export function GroupView({ group }: { group: Group }) {
             />
           )}
           <RoomQueueList group={group} members={members} />
-          {/* Stop only the member that is working; the room carries on. */}
           {threadSpeaker && !group.dm && members.length > 1 && !group.holds?.[threadSpeaker.id] && (
             <div className="flex justify-start pl-12">
               <button
@@ -1593,14 +1590,7 @@ export function GroupView({ group }: { group: Group }) {
       <TranscriptAnnouncer threadKey={transcriptKey} snapshot={announcement} />
 
       {!following && (
-        <button
-          onClick={jumpToLatest}
-          aria-label={t("chat.jumpToLatestAria")}
-          className="animate-pop-in absolute left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-hairline/40 bg-raised px-3 py-1.5 text-[12.5px] text-ink shadow-lg hover:bg-raised-hover"
-          style={{ bottom: composerDock.height }}
-        >
-          <ArrowDown size={13} /> {t("chat.jumpToLatest")}
-        </button>
+        <JumpToLatestButton onClick={jumpToLatest} style={{ bottom: composerDock.height }} />
       )}
 
       <div ref={composerDockRef} className="absolute inset-x-0 bottom-0 z-[2]">

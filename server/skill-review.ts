@@ -492,8 +492,9 @@ export function createSkillReview(deps: SkillReviewDeps): SkillReview {
     const current = running.get(botId);
     if (current) return current.done;
     const controller = new AbortController();
+    const steps = counters.get(key(botId, threadId))?.steps ?? 0;
     const done = review(botId, threadId, controller).catch((error: unknown) =>
-      failed(botId, threadId, `the review stopped (${error instanceof Error ? error.message : "unknown"})`));
+      failed(botId, threadId, `the review stopped (${error instanceof Error ? error.message : "unknown"})`, steps));
     running.set(botId, { threadId, controller, done });
     void done.finally(() => {
       if (running.get(botId)?.controller === controller) running.delete(botId);
