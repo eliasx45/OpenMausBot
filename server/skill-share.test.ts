@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,7 +28,6 @@ const patchAssigned = (botId: string, assignedSkills: string[]) => {
 };
 const id = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 
-/** A learned skill applied to the author's private store, like skill_manage. */
 function learn(botId: string, name: string, body?: string) {
   const staged = skills.stageSkillWrite(botId, { action: "create", files: [{ path: "SKILL.md", content: SKILL(name, body) }], source: learnSource("conversation") });
   if ("error" in staged) throw new Error(staged.error);
@@ -53,16 +52,13 @@ describe("sharing learned skills with the team", () => {
     expect(result.library).toBe("installed");
     expect(result.sha256).toBe(staged.sha256);
     expect(result.assigned.map((bot) => bot.botId)).toEqual([author.id, mate.id]);
-    // the library holds the exact reviewed bytes, enabled
     expect(library.readLibrarySkillFile("rough-cut", root)).toBe(SKILL("rough-cut"));
     expect(library.listLibrarySkills(root)[0]).toMatchObject({ name: "rough-cut", enabled: true });
-    // the private copy is archived write-once and its manifest entry gone
     expect(skills.listSkills(author.id).map((skill) => skill.name)).not.toContain("rough-cut");
     expect(readFileSync(join(library.libraryArchiveDirectory(root, author.id, "rough-cut"), "SKILL.md"), "utf8")).toBe(SKILL("rough-cut"));
     expect(author.assignedSkills).toEqual(["rough-cut"]);
     expect(mate.assignedSkills).toEqual(["existing-skill", "rough-cut"]);
     expect(other.assignedSkills).toBeUndefined();
-    // the author's durable pending assignment is spent once applied
     expect(JSON.parse(readFileSync(join(root, "pending-assignments.json"), "utf8"))[author.id]).toBeUndefined();
     expect(share.sharedAssignmentTimes(mate.id, root)).toEqual({ "rough-cut": 1000 });
     expect(share.sharedAssignmentTimes(author.id, root)).toEqual({});
@@ -97,7 +93,6 @@ describe("sharing learned skills with the team", () => {
     expect(author.assignedSkills).toEqual([]);
     expect(mate.assignedSkills).toEqual(["existing-skill"]);
     expect(share.sharedAssignmentTimes(mate.id, root)).toEqual({});
-    // the retired bytes are archived, never deleted
     expect(readdirSync(join(root, "archive", "retired"))).toHaveLength(1);
   });
 
@@ -105,7 +100,6 @@ describe("sharing learned skills with the team", () => {
     learn(author.id, "rough-cut");
     const first = share.shareLearnedSkill({ author, bots, name: "rough-cut", patchAssigned, root });
     if ("error" in first) throw new Error(first.error);
-    // a teammate improves it: the library copy changes for everyone
     const stale = share.updateSharedLearnedSkill({ bot: mate, bots, name: "rough-cut", skillMd: SKILL("rough-cut", "v2"), expectSha256: "0".repeat(64), patchAssigned, root });
     expect(stale).toEqual({ error: 'skill "rough-cut" changed since it was read — read it again first' });
     const updated = share.updateSharedLearnedSkill({ bot: mate, bots, name: "rough-cut", skillMd: SKILL("rough-cut", "v2"), expectSha256: first.sha256, patchAssigned, root });
@@ -117,9 +111,25 @@ describe("sharing learned skills with the team", () => {
     const undone = share.undoSharedLearnedSkill({ authorId: mate.id, name: "rough-cut", action: "update", share: updated.share, previous: updated.previous, bots, patchAssigned, root });
     expect(undone).toEqual({ undone: true });
     expect(library.readLibrarySkillFile("rough-cut", root)).toBe(SKILL("rough-cut"));
-    // an Undo once the copy changed again is stale and changes nothing
     expect(share.undoSharedLearnedSkill({ authorId: mate.id, name: "rough-cut", action: "update", share: updated.share, previous: updated.previous, bots, patchAssigned, root })).toEqual({ stale: true });
     expect(author.assignedSkills).toEqual(["rough-cut"]);
+  });
+
+  it("refuses the second of two writers that read the same version, so neither update is lost", () => {
+    learn(author.id, "rough-cut");
+    const first = share.shareLearnedSkill({ author, bots, name: "rough-cut", patchAssigned, root });
+    if ("error" in first) throw new Error(first.error);
+    const read = first.sha256.slice(0, share.SHARED_REVISION_CHARS);
+    const fromAuthor = share.updateSharedLearnedSkill({ bot: author, bots, name: "rough-cut", skillMd: SKILL("rough-cut", "author's v2"), expectSha256: read, patchAssigned, root });
+    if ("error" in fromAuthor) throw new Error(fromAuthor.error);
+    const fromMate = share.updateSharedLearnedSkill({ bot: mate, bots, name: "rough-cut", skillMd: SKILL("rough-cut", "mate's v2 from v1"), expectSha256: read, patchAssigned, root });
+    expect(fromMate).toEqual({ error: 'skill "rough-cut" changed since it was read — read it again first' });
+    expect(library.readLibrarySkillFile("rough-cut", root)).toBe(SKILL("rough-cut", "author's v2"));
+    const loose = share.updateSharedLearnedSkill({ bot: mate, bots, name: "rough-cut", skillMd: SKILL("rough-cut", "v3"), expectSha256: fromAuthor.sha256.slice(0, 4), patchAssigned, root });
+    expect(loose).toEqual({ error: 'skill "rough-cut" changed since it was read — read it again first' });
+    const reread = share.updateSharedLearnedSkill({ bot: mate, bots, name: "rough-cut", skillMd: SKILL("rough-cut", "mate's v3"), expectSha256: fromAuthor.sha256.slice(0, share.SHARED_REVISION_CHARS), patchAssigned, root });
+    if ("error" in reread) throw new Error(reread.error);
+    expect(library.readLibrarySkillFile("rough-cut", root)).toBe(SKILL("rough-cut", "mate's v3"));
   });
 
   it("asks by default and is off while the skills library is off", () => {
@@ -137,12 +147,10 @@ describe("sharing learned skills with the team", () => {
     learn(author.id, "rough-cut");
     const result = share.shareLearnedSkill({ author, bots, name: "rough-cut", patchAssigned, root });
     if ("error" in result) throw new Error(result.error);
-    // mate and wide are seen by everyone: neither gets the admins-only bot's skill
     expect(result.assigned.map((bot) => bot.botId)).toEqual([author.id, narrow.id]);
     expect(result.skipped.map((bot) => bot.botId)).toEqual([mate.id, wide.id]);
     expect(result.skipped[0]?.reason).toContain("more people can see it");
     expect(wide.assignedSkills).toEqual([]);
-    // a room's narrower audience narrows it the same way for an open author
     author.visibility = undefined;
     learn(author.id, "color-pass");
     const fromRoom = share.shareLearnedSkill({ author, bots, name: "color-pass", patchAssigned, root, audience: { people: ["ed@example.com"] } });
@@ -155,7 +163,7 @@ describe("sharing learned skills with the team", () => {
     const first = share.shareLearnedSkill({ author, bots, name: "rough-cut", patchAssigned, root });
     if ("error" in first) throw new Error(first.error);
     const restricted = { ...mate, visibility: "admins" };
-    const refused = share.updateSharedLearnedSkill({ bot: restricted, bots: bots.map((bot) => bot.id === mate.id ? restricted : bot), name: "rough-cut", skillMd: SKILL("rough-cut", "secret way"), patchAssigned, root });
+    const refused = share.updateSharedLearnedSkill({ bot: restricted, bots: bots.map((bot) => bot.id === mate.id ? restricted : bot), name: "rough-cut", skillMd: SKILL("rough-cut", "secret way"), expectSha256: first.sha256, patchAssigned, root });
     expect(refused).toEqual({ error: expect.stringContaining("Cutter") });
     expect(library.readLibrarySkillFile("rough-cut", root)).toBe(SKILL("rough-cut"));
   });
@@ -204,15 +212,12 @@ describe("sharing learned skills with the team", () => {
 describe("prompt-cache safety", () => {
   // skillsSystemPrompt reads the default library, so this block uses it.
   beforeEach(() => { root = library.skillsLibraryRoot(); });
-  /** The teammate's system prompt the way server/index.ts composes it for a
-   * conversation: the skills index built from the conversation's assignments. */
   const systemPrompt = (botId: string, startedAt: number | undefined) =>
     buildSystemPrompt("persona", "soul", [
-      { id: "skills", label: "Skills index", text: skills.skillsSystemPrompt(botId, share.conversationAssignedSkills(botId, mate.assignedSkills, startedAt, root)) },
+      { id: "skills", label: "Skills index", text: skills.skillsSystemPrompt(botId, share.conversationAssignedSkills(botId, mate.assignedSkills, startedAt, root), startedAt) },
     ]);
 
   it("keeps an existing conversation's system prompt byte-identical after a share and announces the skill once", () => {
-    // the teammate's existing library skill gives it a non-empty index
     library.installLibrarySkill({ name: "existing-skill", instructions: SKILL("existing-skill"), source: "local-import", reviewState: "approved", root });
     const startedAt = 500;
     const before = systemPrompt(mate.id, startedAt);
@@ -220,26 +225,64 @@ describe("prompt-cache safety", () => {
     const result = share.shareLearnedSkill({ author, bots, name: "rough-cut", patchAssigned, root, now: 1000 });
     if ("error" in result) throw new Error(result.error);
     expect(mate.assignedSkills).toContain("rough-cut");
-    // the conversation that started before the share: same bytes, stable and volatile
     const after = systemPrompt(mate.id, startedAt);
     expect(after.text).toBe(before.text);
     expect(after.stable).toBe(before.stable);
     expect(after.volatile).toBe(before.volatile);
-    // a conversation started after the share lists it
     expect(systemPrompt(mate.id, 2000).text).toContain("rough-cut");
     expect(systemPrompt(mate.id, undefined).text).toContain("rough-cut");
-    // the existing conversation hears about it on its next turn, once
     const note = share.prepareShareNote(mate.id, "thread-1", mate.assignedSkills, startedAt, [], root);
     expect(note.text).toContain("New team skill available: rough-cut");
-    expect(note.text).toContain(library.librarySkillFilePath("rough-cut", root));
-    // a dispatch that failed before the provider took the turn never
-    // committed it, so the next turn carries the note again
+    // quoted as the skills index quotes it (backslashes escaped on Windows)
+    expect(note.text).toContain(JSON.stringify(library.librarySkillFilePath("rough-cut", root)));
     expect(share.prepareShareNote(mate.id, "thread-1", mate.assignedSkills, startedAt, [], root).text).toBe(note.text);
     note.commit();
     expect(share.prepareShareNote(mate.id, "thread-1", mate.assignedSkills, startedAt, [], root).text).toBe("");
-    // a new conversation needs no note: the index already lists it
     expect(share.prepareShareNote(mate.id, "thread-2", mate.assignedSkills, 2000, [], root).text).toBe("");
     expect(existsSync(join(root, "share-notes.json"))).toBe(true);
+  });
+
+  it("keeps a running conversation's description when a shared update changes it", () => {
+    learn(author.id, "rough-cut");
+    const shared = share.shareLearnedSkill({ author, bots, name: "rough-cut", patchAssigned, root, now: 1000 });
+    if ("error" in shared) throw new Error(shared.error);
+    const startedAt = 1500;
+    const before = systemPrompt(mate.id, startedAt);
+    expect(before.text).toContain("Cuts a rough edit the way this team does.");
+    const renamed = SKILL("rough-cut", "v2").replace("Cuts a rough edit the way this team does.", "Cuts a rough edit, then a fine cut.");
+    const updated = share.updateSharedLearnedSkill({ bot: mate, bots, name: "rough-cut", skillMd: renamed, expectSha256: shared.sha256, patchAssigned, root });
+    if ("error" in updated) throw new Error(updated.error);
+    expect(systemPrompt(mate.id, startedAt).stable).toBe(before.stable);
+    expect(systemPrompt(mate.id, Date.now() + 1).text).toContain("Cuts a rough edit, then a fine cut.");
+    expect(systemPrompt(mate.id, undefined).text).toContain("Cuts a rough edit, then a fine cut.");
+    expect(share.undoSharedLearnedSkill({ authorId: mate.id, name: "rough-cut", action: "update", share: updated.share, previous: updated.previous, bots, patchAssigned, root })).toEqual({ undone: true });
+    expect(systemPrompt(mate.id, startedAt).stable).toBe(before.stable);
+  });
+
+  it("keeps replaced descriptions for 30 days, then prunes them by age", () => {
+    learn(author.id, "trim-pass");
+    const shared = share.shareLearnedSkill({ author, bots, name: "trim-pass", patchAssigned, root, now: 1000 });
+    if ("error" in shared) throw new Error(shared.error);
+    const describe = (n: number) => SKILL("trim-pass", `v${n}`).replace("Cuts a rough edit the way this team does.", `Description ${n}.`);
+    const update = (n: number) => {
+      const sha256 = library.readSkillLibraryIndex(root)["trim-pass"]!.sha256;
+      const updated = share.updateSharedLearnedSkill({ bot: mate, bots, name: "trim-pass", skillMd: describe(n), expectSha256: sha256, patchAssigned, root });
+      if ("error" in updated) throw new Error(updated.error);
+    };
+    const day = 24 * 60 * 60 * 1000;
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100 * day);
+      update(1);
+      for (let n = 2; n <= 30; n++) { vi.setSystemTime(100 * day + n); update(n); }
+      expect(library.libraryDescriptionsAt(50 * day, root)("trim-pass", "now")).toBe("Cuts a rough edit the way this team does.");
+      expect(library.libraryDescriptionsAt(100 * day + 5, root)("trim-pass", "now")).toBe("Description 5.");
+      vi.setSystemTime(131 * day);
+      update(31);
+      expect(library.readSkillLibraryIndex(root)["trim-pass"]!.descriptionHistory).toEqual([{ description: "Description 30.", until: 131 * day }]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("changes nothing for a bot no share touched", () => {
@@ -247,4 +290,43 @@ describe("prompt-cache safety", () => {
     expect(share.conversationAssignedSkills(other.id, undefined, 1, root)).toBeUndefined();
     expect(share.prepareShareNote(other.id, "t", ["a"], 1, [], root).text).toBe("");
   });
+});
+
+
+it("shares reviewed references and preserves them through a reference-only update and undo", () => {
+  const content = SKILL("reference-cut", "Read references/cuts.md before editing.");
+  const references = [{ path: "references/cuts.md", content: "Keep the approved cut." }];
+  const staged = skills.stageSkillWrite(author.id, { action: "create", files: [{ path: "SKILL.md", content }, ...references], source: learnSource("conversation") });
+  if ("error" in staged) throw new Error(staged.error);
+  const applied = skills.applyStagedSkillWrite(author.id, staged.id);
+  if ("error" in applied) throw new Error(applied.error);
+  const shared = share.shareLearnedSkill({ author, bots, name: staged.name, patchAssigned, root, expectSha256: staged.sha256, expectReferencesSha256: staged.referencesSha256 });
+  if ("error" in shared) throw new Error(shared.error);
+  expect(library.readLibrarySkillReferences(staged.name, root)).toEqual(references);
+  expect(readFileSync(join(library.libraryArchiveDirectory(root, author.id, staged.name), references[0].path), "utf8")).toBe(references[0].content);
+  const initialRevision = library.librarySkillRevision(library.readSkillLibraryIndex(root)[staged.name]);
+  const updated = share.updateSharedLearnedSkill({ bot: mate, bots, name: staged.name, skillMd: content,
+    references: [{ path: references[0].path, content: "Keep the new cut." }], expectSha256: initialRevision, patchAssigned, root });
+  if ("error" in updated) throw new Error(updated.error);
+  expect(updated.sha256).toBe(shared.sha256);
+  expect(updated.share.referencesSha256).not.toBe(shared.referencesSha256);
+  expect(share.updateSharedLearnedSkill({ bot: author, bots, name: staged.name, skillMd: content,
+    references, expectSha256: initialRevision, patchAssigned, root })).toHaveProperty("error");
+  expect(share.undoSharedLearnedSkill({ authorId: author.id, name: staged.name, action: "create", share: shared, bots, patchAssigned, root })).toEqual({ stale: true });
+  expect(share.undoSharedLearnedSkill({ authorId: mate.id, name: staged.name, action: "update", share: updated.share, previous: updated.previous, bots, patchAssigned, root })).toEqual({ undone: true });
+  expect(library.readLibrarySkillReferences(staged.name, root)).toEqual(references);
+  writeFileSync(join(library.librarySkillDirectory(root, staged.name), references[0].path), "Changed outside review");
+  expect(library.readLibrarySkillFile(staged.name, root)).toBeNull();
+  expect(library.listLibrarySkills(root).find(skill => skill.name === staged.name)?.enabled).toBe(false);
+});
+
+it("migrates reviewed learned reference files without dropping them", async () => {
+  const { migrateBotSkillsToLibrary } = await import("./skills-library-migration.ts");
+  const files = [{ path: "SKILL.md", content: SKILL("migrated-reference") }, { path: "references/notes.md", content: "Approved notes" }];
+  const staged = skills.stageSkillWrite(author.id, { action: "create", files, source: learnSource("conversation") });
+  if ("error" in staged) throw new Error(staged.error);
+  expect(skills.applyStagedSkillWrite(author.id, staged.id)).not.toHaveProperty("error");
+  const report = migrateBotSkillsToLibrary(author.id, root);
+  expect(report.outcomes[0].outcome).toBe("migrated");
+  expect(library.readLibrarySkillReferences(staged.name, root)).toEqual(files.slice(1));
 });

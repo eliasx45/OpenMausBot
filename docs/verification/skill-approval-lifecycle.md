@@ -50,3 +50,18 @@ rollback from duplicate responses or navigation to another thread.
 This proves the reported lifecycle with real server/renderer state and a
 synthetic skill. It does not prove provider-specific tool behavior or recover
 a bot that the user has already deleted.
+
+
+## Learned references shared with a team
+
+`pnpm exec vitest run server/shared-skill-references.e2e.test.ts` starts an
+isolated server and fake engine. It creates a learned skill with a reviewed
+reference file, shares it automatically, updates only that reference through a
+teammate's capability, rejects the old revision and restores the complete prior
+file set through Undo. Shared revisions bind both SKILL.md and references.
+
+`server/skill-share.test.ts` also checks reference-aware migration, tamper
+rejection and stale Undo. `server/skill-library-files.test.ts` checks that an
+index-write failure restores the prior skill directory instead of leaving a
+mixture of old and new files. Imported skills retain their SKILL.md-only review
+boundary; these reference files belong to reviewed learned skills.

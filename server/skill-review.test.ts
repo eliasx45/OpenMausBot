@@ -1,8 +1,3 @@
-// Automatic skill learning (server/skill-review.ts): step counting, the
-// bounded transcript, the prompt's read-before-write rule, answer parsing,
-// and the scheduler against a scripted engine — persisted counters, the
-// threshold, deferral while the bot is busy, stale updates, failures and
-// cancellation.
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +21,7 @@ import {
   type ReviewSkill,
   type SkillReviewDeps,
 } from "./skill-review.ts";
+import { createSideJobs, type SideJobInstance, type SideJobsDeps } from "./side-jobs.ts";
 
 const BOT = { id: "bot-1", name: "Scout" };
 const skillMd = (name: string, body = "Do the thing.") =>
@@ -63,7 +59,6 @@ describe("the review transcript", () => {
     expect(text).toContain("Scout[tools: Bash]");
     expect(text).toContain("  [tool] Bash: ls 59");
     expect(text).toContain("answer 59");
-    // a digest line is clipped; a recent line is not
     expect(text).toMatch(/Person: question 0 x+…/);
     expect(text.length).toBeLessThanOrEqual(TRANSCRIPT_MAX_CHARS);
   });
@@ -221,7 +216,6 @@ describe("the scheduler", () => {
     first.review.stop();
     expect(JSON.parse(readFileSync(statePath, "utf8")).counters).toEqual([expect.objectContaining({ botId: BOT.id, threadId: "thread-a", steps: 2 })]);
 
-    // a restart reads the counter back; one more short turn makes it due
     const second = harness();
     expect(second.review.status(BOT.id, "thread-a").steps).toBe(2);
     second.review.noteTurn(BOT.id, "thread-a", 1);
@@ -261,7 +255,6 @@ describe("the scheduler", () => {
     const called = nextCall();
     review.botSettled(BOT.id);
     await called;
-    // the person writes again: the bot is busy when the answer arrives
     state.busy = true;
     review.noteTurn(BOT.id, "thread-a", 2);
     release(createAnswer);
@@ -272,7 +265,6 @@ describe("the scheduler", () => {
     state.busy = false;
     review.botSettled(BOT.id);
     await expect.poll(() => state.applied.length).toBe(1);
-    // steps run while the review was out still count toward the next one
     expect(review.status(BOT.id, "thread-a")).toMatchObject({ waiting: false, steps: 2 });
   });
 
@@ -324,6 +316,27 @@ describe("the scheduler", () => {
     expect(review.status(BOT.id, "thread-a").steps).toBe(3);
   });
 
+  it("gives up only on the steps a failed review covered, keeping work noted while it ran", async () => {
+    let now = 1_000_000;
+    let release: () => void = () => {};
+    const { review, nextCall } = harness({
+      now: () => now,
+      answer: () => new Promise<string>((resolve) => { release = () => resolve(createAnswer); }),
+      apply: () => { throw new Error("disk full"); },
+    });
+    review.noteTurn(BOT.id, "thread-a", 40);
+    for (let attempt = 1; attempt <= MAX_FAILED_REVIEWS; attempt++) {
+      const called = nextCall();
+      const done = review.run(BOT.id, "thread-a");
+      await called;
+      if (attempt === MAX_FAILED_REVIEWS) review.noteTurn(BOT.id, "thread-a", 2);
+      release();
+      expect(await done).toMatchObject({ state: "failed" });
+      now += 16 * 60_000;
+    }
+    expect(review.status(BOT.id, "thread-a").steps).toBe(2);
+  });
+
   it("tells the engine how long the review may take", async () => {
     const { review, state } = harness();
     review.noteTurn(BOT.id, "thread-a", 3);
@@ -341,6 +354,56 @@ describe("the scheduler", () => {
     expect(await done).toMatchObject({ state: "cancelled" });
     expect(state.applied).toEqual([]);
     expect(review.status(BOT.id, "thread-a").steps).toBe(0);
+  });
+
+  function helperReviewer(write: NonNullable<SideJobInstance["generateText"]>, helper: { instanceId: string } | null = { instanceId: "helper" }) {
+    const booked: Array<Parameters<SideJobsDeps["book"]>[0]> = [];
+    const engines: Record<string, SideJobInstance> = {
+      pi: { instanceId: "pi", driverKind: "piAgent", enabled: true, adapter: { capabilities: { agentsMcp: true } } },
+      helper: { instanceId: "helper", driverKind: "openai-compat", enabled: true, adapter: { capabilities: { agentsMcp: true } }, generateText: write },
+    };
+    const jobs = createSideJobs({
+      bot: (id) => (id === BOT.id ? { ...BOT, threadId: "main", modelSelection: { instanceId: "pi" } } : undefined),
+      instance: (id) => engines[id] ?? null,
+      refusal: () => undefined,
+      helper: () => helper,
+      assertWithinBudget: () => {},
+      book: (row) => booked.push(row),
+    });
+    return { engine: (botId: string) => jobs.text("skill-review", botId), booked };
+  }
+
+  it("is written by the helper model for a bot whose engine has no text call, and waits like any failed review when the helper fails", async () => {
+    const prompts: string[] = [];
+    let failing = false;
+    const { engine, booked } = helperReviewer(async (prompt, options) => {
+      prompts.push(prompt);
+      if (failing) throw new Error("503 from the helper's provider");
+      options?.onUsage?.({ model: "gpt-5.4-mini", input: 4_000, output: 300 });
+      return createAnswer;
+    });
+    const { review, state } = harness({ engine });
+    review.noteTurn(BOT.id, "thread-a", 3);
+    expect(await review.run(BOT.id, "thread-a")).toMatchObject({ state: "applied", applied: ["chart-making"] });
+    expect(prompts[0]).toContain(SKILL_REVIEW_MARKER);
+    expect(booked).toEqual([expect.objectContaining({ botId: BOT.id, instanceId: "helper", model: "gpt-5.4-mini", trigger: { kind: "helper", botId: BOT.id, job: "skill-review" } })]);
+
+    // a helper that fails is an ordinary failed review: nothing applied, the
+    // counter kept for the retry, and no error leaves the scheduler
+    failing = true;
+    review.noteTurn(BOT.id, "thread-b", 3);
+    expect(await review.run(BOT.id, "thread-b")).toMatchObject({ state: "failed" });
+    expect(review.status(BOT.id, "thread-b").steps).toBe(3);
+    expect(state.applied).toHaveLength(1);
+    expect(booked).toHaveLength(1);
+  });
+
+  it("does not review that bot while no helper is set, as before", async () => {
+    const write = async () => createAnswer;
+    const { review, state } = harness({ engine: helperReviewer(write, null).engine });
+    review.noteTurn(BOT.id, "thread-a", 3);
+    expect(await review.run(BOT.id, "thread-a")).toMatchObject({ state: "failed", note: "this bot's engine cannot run a background review" });
+    expect(state.applied).toEqual([]);
   });
 
   it("refuses a bot without a capable engine and forgets a conversation that is gone", async () => {

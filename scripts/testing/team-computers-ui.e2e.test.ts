@@ -53,7 +53,7 @@ type Computer = { id: string; name: string; section: string | null; state: strin
     const record = async (id: string) => (await computers()).find(computer => computer.id === id);
     const receipts = () => provider("GET", "/__fixture");
     const focused = () => evaluate("document.activeElement?.getAttribute('aria-label') || document.activeElement?.textContent?.trim()");
-    const openMap = async () => { await click("Tools"); await click("Team map"); await expect.poll(snapshot).toContain('region "Team canvas"'); };
+    const openMap = async () => { if (await evaluate(`document.querySelector('[data-tour="tools"] button[aria-expanded]')?.getAttribute("aria-expanded") === "false"`)) await click("Tools"); await click("Team map"); await expect.poll(snapshot).toContain('region "Team canvas"'); };
     await api("PATCH", `/api/bots/${fixture.botId}`, { name: "Ada", section: "Engineering", computer: "off" });
     await api("POST", "/api/sidebar-sections", { name: "Research" });
     await api("POST", "/api/bots", { name: "Ben", section: "Research", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } });
@@ -155,7 +155,11 @@ type Computer = { id: string; name: string; section: string | null; state: strin
     await expect.poll(snapshot, { timeout: 10_000 }).toContain("Ben's screen");
     await expect.poll(snapshot, { timeout: 20_000, interval: 250 }).toContain("Uses Engineering desktop, the cloud computer this team shares.");
     expect(await snapshot()).not.toContain("Choose Cloud");
-    await click("Open Team map");
+    const mapButtons = Object.entries((await ui("snapshot")).refs as Record<string, { name: string; role: string }>)
+      .filter(([, element]) => element.role === "button" && element.name === "Open Team map");
+    expect(mapButtons.length).toBeGreaterThan(0);
+    await ui("click", "--ref", `@${mapButtons[0][0]}`);
+    await expect.poll(snapshot).toContain('region "Team canvas"');
     expect((await receipts()).calls.filter((call: { method: string; path: string }) => call.method === "POST" && call.path === "/sandboxes")).toHaveLength(1);
     await evaluate("location.reload(); true");
     await expect.poll(snapshot, { timeout: 15_000 }).toContain("Actions for Ada");

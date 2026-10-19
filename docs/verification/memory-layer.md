@@ -9,9 +9,10 @@ is off, and every memory write is a journaled, undoable row. See [the memory gui
 
 ```sh
 pnpm exec vitest run server/memory-layer.e2e.test.ts
-pnpm exec vitest run server/memory-capture-restart.e2e.test.ts
+pnpm exec vitest run server/memory-capture-restart.e2e.test.ts server/delete-bot-memory.e2e.test.ts
 pnpm exec vitest run server/spend-cap-api.test.ts
 pnpm exec vitest run server/memory-entries.test.ts server/recall.test.ts server/memory-upkeep.test.ts server/workspace.test.ts
+pnpm exec vitest run server/side-jobs.test.ts server/helper-model.e2e.test.ts
 pnpm exec vitest run src/components/bot-settings/MemorySection.test.ts src/lib/memory.test.ts server/drivers/agents-catalog-wire.test.ts
 ```
 
@@ -34,7 +35,9 @@ Evidence covers:
 - The tidy-up archives the expired entry and strikes the contradicted one, reports it, and Undo restores the file.
 - A routine run is not captured as a person's conversation and never adds owner facts to About me.
 - A turn still waiting for the quiet spell when the server stops is saved as ids only, read back from the transcript after a restart, and captured then (POSIX: a Windows SIGTERM skips the shutdown hooks).
+- Deleting a bot removes its journal, search index, upkeep status and captures saved at shutdown; other bots' records and delegated/failure metadata are preserved.
 - Background calls book their actual helper model, tokens and cost to the bot's usage. Capture, organization and contradiction checks each respect the configured monthly cap; free deterministic cleanup still runs at the cap.
+- With the `helper` setting naming an instance (`server/helper-model.e2e.test.ts`, its own server with the fake Claude, Codex and Pi engines): a Pi bot, whose engine has no one-shot text call, captures through the helper with the model the setting names, booked as a helper call for that bot, and its conversation is reviewed for skills the same way; a Codex bot beside it keeps its own background call for upkeep, and a Claude bot its own engine and quick model. Without the setting the Pi bot reports no model steps. A Pi bot switched to never use the helper (`PATCH /api/bots/:id` with `helperModel: false`; a wrong type is refused and the switch is in `bots.json`) reports no model steps, has its capture and its skill review refused for want of an engine and gets the excerpt summary, with no helper call booked; switched back, it has model steps again. A bot created with `settings.helperModel: false`, which is what the sidebar's Duplicate sends for a source kept off the helper (`src/lib/bot-duplicate.test.ts`), has the switch in its saved record before any later request. The second server also shows the setting followed from `config.json` as the file changes, and a settings request unable to set or clear it.
 
 Unit tests add the share limit on small notebooks (no contradiction change below
 five entries), the nightly schedule (once a day after the hour, never while the
@@ -53,3 +56,26 @@ The fake engine answers the model steps with scripted JSON, so these tests
 prove the plumbing, not the quality of what a real model captures or judges
 contradictory. Check that by hand with a real Claude bot: switch upkeep on,
 mention a preference in passing, wait two minutes, and read the Memory panel.
+
+## Team integrity and editing evidence
+
+Run the isolated regression checks:
+
+```sh
+pnpm exec vitest run server/team-memory.test.ts server/recall.test.ts server/memory-learning.test.ts server/memory-topic-corrections.test.ts server/project-evidence.test.ts
+pnpm exec vitest run server/memory-integrity.e2e.test.ts server/trust-controls.e2e.test.ts server/team-lifecycle.e2e.test.ts server/cloud-lending-memory.e2e.test.ts
+pnpm exec vitest run src/components/TeamMemoryDialog.test.ts server/drivers/agents-catalog-wire.test.ts
+pnpm run typecheck
+```
+
+The integrity fixture uses the shared launcher and fake engine with its own data,
+project and preview files. It checks rename/name reuse, revision conflicts,
+shared search, reviewed room capture reaching another bot, source-backed lessons
+from a fresh bot-only delegated thread, and separate output
+approval becoming stale when the saved project changes. Unit checks cover late
+matching passages, pinned prompt budgets, keyed corrections/history, rejected
+source quotes, private-chat sharing exclusion, failure lessons, bounded topic
+contradiction checks, legacy ownership, and path/symlink containment.
+The renderer tests exercise the actual dialog's stale-edit draft retention and
+revision-bearing pin action. Model answers remain scripted: these checks do not
+measure real-model extraction accuracy or certify editing/render fidelity.

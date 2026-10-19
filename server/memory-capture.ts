@@ -1,41 +1,25 @@
-// Background fact capture, for a bot with Memory upkeep on. A fact said in
-// passing ("I'm vegetarian", "the launch moved to Friday") otherwise lives in
-// one chat until it is compacted away, unless the bot happened to call
-// memory_update. After a chat goes quiet, one tool-free model call reads the
-// finished turns — the person's words and the bot's under different rules —
-// beside the current MEMORY.md, and proposes up to eight facts. With Learn
-// from group chats on, a member bot's room turns are read too: the person's
+// With Learn from group chats on, a member bot's room turns are read too: the person's
 // lines as the person's, other people's and other bots' under narrower
 // rules (the background review Hermes Agent runs in group threads, MIT).
-// Pure here:
-// prompt, parsing, dedupe and the per-thread buffer. Wiring and writes live
-// in memory-upkeep.ts.
 import { factIdentity, isMemoryDate, notebookIdentities } from "./memory-entries.ts";
 
-export type CandidateKind = "preference" | "fact" | "decision" | "outcome";
-export const CANDIDATE_KINDS: readonly CandidateKind[] = ["preference", "fact", "decision", "outcome"];
+export type CandidateKind = "preference" | "fact" | "decision" | "outcome" | "lesson" | "question";
+export const CANDIDATE_KINDS: readonly CandidateKind[] = ["preference", "fact", "decision", "outcome", "lesson", "question"];
 
 export interface Candidate {
+  sourceTurn?: number;
+  sourceQuote?: string;
+  teamName?: string;
+  key?: string;
   text: string;
   kind: CandidateKind;
-  /** YYYY-MM-DD, the last day a temporary fact holds. */
   until?: string;
-  /** About the person themselves, useful to any of their bots: added to
-   * the shared About me straight away and listed in Settings, where the
-   * person can remove it from About me (server/profile-learned.ts). */
   aboutUser: boolean;
-  /** Already in the notebook, listed again only as an About me candidate:
-   * never appended. */
   noted?: boolean;
-  /** The topic file the fact belongs in (`food`, `family`, `northwind`);
-   * absent for a core fact, which goes to MEMORY.md. */
   topic?: string;
-  /** Other words for that topic, added to its header. */
   topicAliases?: string[];
 }
 
-/** A model's topic name as a file name: lower-case words joined by dashes,
- * or null when nothing usable is left. "archive" and "memory" are reserved. */
 export function topicFileName(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const name = raw.toLowerCase().replace(/\.md$/, "").replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40);
@@ -45,52 +29,52 @@ export function topicFileName(raw: unknown): string | null {
 
 export const MIN_CONFIDENCE = 0.6;
 export const MAX_CANDIDATES = 8;
-const TEXT_MAX = 300;
-const LINE_MAX = 1_500;
+const TEXT_MAX = 600;
+const LINE_MAX = 6_000;
 const NOTEBOOK_MAX = 6_000;
 export const CAPTURE_MARKER = "You are the CAPTURE step of a memory system";
 
-/** One line of a room the bot read before its reply. "person" is the person
- * this computer belongs to; "other" another person of a shared workspace;
- * "peer" another bot of the room. */
 export interface RoomLine {
   by: "person" | "other" | "peer";
   name: string;
   text: string;
+  messageId?: string;
 }
 
 export interface CaptureTurn {
-  /** In a room: the person's own lines of the turn, joined. */
+  sourceMessageId?: string;
+  personMessageId?: string;
+  failed?: boolean;
+  delegated?: boolean;
+  evidence?: string;
   person: string;
   bot: string;
-  /** False when another person of a shared workspace sent the message:
-   * their facts may be kept, but never offered for the owner's About me. */
+  /** Another person's facts may be kept, but never offered for the owner's About me. */
   owner?: boolean;
-  /** The finished turn this came from. A batch still waiting at shutdown is
-   * saved as these ids, never as text, and read back from the transcript at
-   * the next start (memory-upkeep.ts). */
   turnId?: string;
-  /** Set for a room turn: what the bot read since it last spoke there,
-   * oldest first. The prompt shows these lines instead of `person`. */
   room?: RoomLine[];
 }
 
 const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-/** The weekday of a YYYY-MM-DD day, so "this Friday" can be turned into a date. */
 function weekday(day: string): string {
   return WEEKDAYS[new Date(`${day}T12:00:00Z`).getUTCDay()] ?? "";
 }
 
 export function capturePrompt(input: { botName: string; turns: readonly CaptureTurn[]; notebook: string; today: string; topics?: string }): string {
-  const clip = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, LINE_MAX);
+  const clip = (text: string) => {
+    const folded = text.replace(/\s+/g, " ").trim();
+    return folded.length <= LINE_MAX ? folded : `${folded.slice(0, LINE_MAX / 2)} [middle omitted; consult source message] ${folded.slice(-LINE_MAX / 2)}`;
+  };
   const said = (line: RoomLine) =>
     line.by === "person" ? `Person: ${clip(line.text)}`
     : line.by === "other" ? `${clip(line.name).slice(0, 40)} (another person): ${clip(line.text)}`
     : `${clip(line.name).slice(0, 40)} (another bot): ${clip(line.text)}`;
   const conversation = input.turns
-    .flatMap((turn) => [
+    .flatMap((turn, index) => [
+      `Turn [${index}]${turn.delegated ? " DELEGATED: other bots are not the owner; propose only work lessons, questions or reported outcomes" : ""}${turn.failed ? " FAILED: capture only an evidenced lesson or open question" : ""}:`,
       ...(turn.room ? turn.room.filter((line) => line.text.trim()).map(said) : [turn.person.trim() ? `Person: ${clip(turn.person)}` : ""]),
       turn.bot.trim() ? `${input.botName}: ${clip(turn.bot)}` : "",
+      turn.evidence ? `Observed activity (not approval): ${clip(turn.evidence)}` : "",
     ])
     .filter(Boolean)
     .join("\n");
@@ -117,6 +101,9 @@ export function capturePrompt(input: { botName: string; turns: readonly CaptureT
     "- aboutUser is true only for a durable fact about the Person themselves that any of their assistants should know (a diet, where they live, their company, how they like to be spoken to).",
     "",
     "Where each fact goes:",
+    "- For every item include sourceTurn (the numbered turn) and sourceQuote (an exact excerpt from that turn, at most 600 characters). Never infer success from an assistant saying done. An outcome is only a reported outcome until artifacts are checked and a person approves the exact revision.",
+    "- Project-specific decisions belong to that project even when they are not lasting personal facts. Keep a correction needed for future handoffs; do not turn it into a global preference.",
+    "- Group decisions, durable lessons (including from failures), and unresolved project questions should include teamName (short title) and key (stable project/fact key, reused when a decision changes). These become shared proposals for review, never silently approved facts. Keep the decision and a short reason or rejected alternative together. Do not publish personal information as a team note.",
     "- No topic: a core fact the assistant needs in every conversation — who the Person is, their core preferences, standing decisions.",
     "- A topic: everything else, grouped by subject — a person (\"asha\"), a place, a project or client, a domain of preferences (\"food\", \"travel\"), their work. Reuse an existing topic name when one fits; otherwise name a new one in one or two words. Always give topicAliases: two to five other words someone might use when asking about that subject (for food: restaurants, dinner, lunch, cuisine; for a sister: family, sibling, her name).",
     "",
@@ -127,11 +114,10 @@ export function capturePrompt(input: { botName: string; turns: readonly CaptureT
     "",
     "Work through the Person's messages sentence by sentence and check each stated fact against these rules before answering.",
     `Answer with a JSON list and nothing else, at most ${MAX_CANDIDATES} items. Answer [] only when the Person stated nothing worth keeping:`,
-    '[{"text": "...", "kind": "preference|fact|decision|outcome", "until": "YYYY-MM-DD or omit", "aboutUser": true|false, "noted": true|false, "topic": "name or omit", "topicAliases": ["..."], "confidence": 0..1}]',
+    '[{"text": "...", "kind": "preference|fact|decision|outcome|lesson|question", "until": "YYYY-MM-DD or omit", "aboutUser": true|false, "noted": true|false, "topic": "name or omit", "topicAliases": ["..."], "confidence": 0..1, "sourceTurn": 0, "sourceQuote": "exact excerpt", "teamName": "optional title", "key": "optional project/fact"}]',
   ].join("\n");
 }
 
-/** The JSON inside a model's answer, fenced or bare. */
 function jsonPayload(text: string): unknown {
   const trimmed = text.trim();
   const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(trimmed);
@@ -158,16 +144,19 @@ export function parseCandidates(text: string, today: string): Candidate[] {
   const out: Candidate[] = [];
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
-    const { text: raw, kind, until, aboutUser, noted, topic, topicAliases, confidence } = item as Record<string, unknown>;
+    const { text: raw, kind, until, aboutUser, noted, topic, topicAliases, confidence, sourceTurn, sourceQuote, teamName, key } = item as Record<string, unknown>;
     if (typeof raw !== "string" || !raw.trim()) continue;
     if (typeof kind !== "string" || !CANDIDATE_KINDS.includes(kind as CandidateKind)) continue;
     if (typeof confidence === "number" && confidence < MIN_CONFIDENCE) continue;
     const factText = raw.replace(/\s+/g, " ").replace(/^\s*(?:[-*•]|\d+[.)])\s+/, "").trim().slice(0, TEXT_MAX);
     if (!factText) continue;
-    // an until in the past is a fact that is already over
     const validUntil = isMemoryDate(until) && until >= today ? until : undefined;
     if (isMemoryDate(until) && !validUntil) continue;
     out.push({
+      ...(Number.isInteger(sourceTurn) && Number(sourceTurn) >= 0 ? { sourceTurn: Number(sourceTurn) } : {}),
+      ...(typeof sourceQuote === "string" && sourceQuote.trim() ? { sourceQuote: sourceQuote.trim().slice(0, 600) } : {}),
+      ...(typeof teamName === "string" && teamName.trim() ? { teamName: teamName.trim().slice(0, 120) } : {}),
+      ...(typeof key === "string" && key.trim() ? { key: key.trim().slice(0, 240) } : {}),
       text: factText,
       kind: kind as CandidateKind,
       ...(validUntil ? { until: validUntil } : {}),
@@ -183,8 +172,6 @@ export function parseCandidates(text: string, today: string): Candidate[] {
   return out;
 }
 
-/** Candidates not already in the notebook, and not repeated among
- * themselves, by the exact identity rule (signs, symbols and case kept). */
 export function newCandidates(candidates: readonly Candidate[], notebook: string): Candidate[] {
   const seen = notebookIdentities(notebook);
   const out: Candidate[] = [];
@@ -204,10 +191,6 @@ export interface CaptureBatch {
   turns: CaptureTurn[];
 }
 
-/** Finished turns wait here per bot and thread (a room's thread holds the
- * turns of every member bot, each its own batch) and go out together after
- * a quiet spell, or at once at the count: one model call per batch, never
- * on the turn path. */
 export class CaptureBuffer {
   private readonly pending = new Map<string, { botId: string; threadId: string; turns: CaptureTurn[]; timer: ReturnType<typeof setTimeout> | null }>();
   private readonly opts: { quietMs: () => number; maxTurns: number; onFlush: (batch: CaptureBatch) => void };
@@ -238,14 +221,12 @@ export class CaptureBuffer {
     if (entry.turns.length) this.opts.onFlush({ botId: entry.botId, threadId: entry.threadId, turns: entry.turns });
   }
 
-  /** Every bot's waiting turns of this thread, now. */
   flush(threadId: string): void {
     for (const [key, entry] of Array.from(this.pending.entries())) {
       if (entry.threadId === threadId) this.flushKey(key);
     }
   }
 
-  /** Drop a bot's waiting turns: its upkeep was switched off, or it was deleted. */
   dropBot(botId: string): void {
     for (const [key, entry] of Array.from(this.pending.entries())) {
       if (entry.botId !== botId) continue;
@@ -254,7 +235,6 @@ export class CaptureBuffer {
     }
   }
 
-  /** Every waiting batch, without capturing it: shutdown saves them. */
   drain(): CaptureBatch[] {
     const batches: CaptureBatch[] = [];
     for (const [key, entry] of Array.from(this.pending.entries())) {

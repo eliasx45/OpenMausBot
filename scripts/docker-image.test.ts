@@ -6,8 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 // The published images: the self-hosted server (the default target) and the
-// Cloud home (docs/cloud-pro.md). A pull downloads every layer whose digest
-// changed, and a layer's digest changes when anything beneath it does.
+// Cloud home. A pull downloads every layer whose digest changed, and a layer's
+// digest changes when anything beneath it does.
 const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
 const workflow = parse(readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8"));
 
@@ -232,8 +232,8 @@ describe("container images", () => {
       fake("npm", `case "$2" in @anthropic-ai/claude-code@latest) echo 2.1.291;; @openai/codex@latest) echo 0.160.1;; *) exit 1;; esac`);
       const output = join(root, "output");
       writeFileSync(output, "");
-      const result = spawnSync("bash", ["-e", "-c", keys.run!], {
-        env: { ...keys.env, PATH: `${root}:${dirname(jq)}:/usr/bin:/bin`, GITHUB_OUTPUT: output }, encoding: "utf8",
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-e", "-c", keys.run!], {
+        env: { ...keys.env, PATH: `${root}:${dirname(jq)}:/usr/bin:/bin`, GITHUB_OUTPUT: output, BASH_ENV: "/dev/null" }, encoding: "utf8",
       });
       expect(result.status, result.stderr).toBe(0);
       return Object.fromEntries(readFileSync(output, "utf8").trim().split("\n").map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
@@ -245,5 +245,15 @@ describe("container images", () => {
     });
     const today = `date-${new Date().toISOString().slice(0, 10)}`;
     expect(resolve(false)).toEqual({ chrome: today, engines: "@anthropic-ai/claude-code @openai/codex", engines_tag: today });
+  });
+
+  // An init collects browser processes whose parents exit, and Chrome gets the
+  // shared memory OpenMausBot's desktop containers give it.
+  it("runs every compose service of the server image with an init and Chrome's shared memory", () => {
+    for (const file of ["../compose.yaml", "../deploy/docker-compose.yml", "../deploy/podman/compose.yaml"]) {
+      const service = parse(readFileSync(new URL(file, import.meta.url), "utf8")).services.omb;
+      expect(service.init, file).toBe(true);
+      expect(service.shm_size, file).toBe("512m");
+    }
   });
 });

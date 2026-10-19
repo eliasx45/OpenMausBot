@@ -1,14 +1,11 @@
-// Deleting a bot removes its conversations and its memory. The journal
-// lives outside the workspace and the search index lives in the message
-// database, so both have to go too. Checked against the fixture server.
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it } from "vitest";
 import { launchVerificationServer, runControlOmb } from "../scripts/control-omb.ts";
 import type { WireBot } from "../shared/wire.ts";
 
-it("deletes the memory journal and memory index with the bot", async () => {
+it("deletes the bot's journal, index, upkeep status and saved turns while preserving other bots", async () => {
   const fixture = await launchVerificationServer();
   const control = (...args: string[]) => runControlOmb([...args, "--url", fixture.info.url]);
   const api = async <T = unknown>(path: string, method = "GET", body?: unknown, status = 200): Promise<T> => {
@@ -38,6 +35,7 @@ it("deletes the memory journal and memory index with the bot", async () => {
     await api(`/api/bots/${kept.id}/memory/file`, "PUT", { path: "memory/notes.md", text: "other notes\n" });
     const journal = await api<{ entries: unknown[] }>(`/api/bots/${bot.id}/memory/journal`);
     expect(journal.entries.length).toBeGreaterThan(0);
+    expect((await api<{ entries: unknown[] }>(`/api/bots/${kept.id}/memory/journal`)).entries.length).toBeGreaterThan(0);
     const journalPath = join(fixture.info.dataDir, "memory-journal", `${bot.id}.ndjson`);
     const keptJournal = join(fixture.info.dataDir, "memory-journal", `${kept.id}.ndjson`);
     expect(existsSync(journalPath)).toBe(true);
@@ -49,8 +47,23 @@ it("deletes the memory journal and memory index with the bot", async () => {
     expect(memoryRows(bot.id)).toBeGreaterThan(0);
     const keptRows = memoryRows(kept.id);
     expect(keptRows).toBeGreaterThan(0);
+    for (const current of [bot, kept]) {
+      await api(`/api/bots/${current.id}`, "PATCH", { memoryUpkeep: true });
+      await api(`/api/bots/${current.id}/memory/tidy`, "POST");
+    }
+    const statusPath = join(fixture.info.dataDir, "memory-upkeep.json");
+    const pendingPath = join(fixture.info.dataDir, "memory-capture-pending.json");
+    expect(JSON.parse(readFileSync(statusPath, "utf8")).bots[bot.id].lastTidy).toBeDefined();
+    const keptPending = { botId: kept.id, threadId: kept.threadId, turnIds: ["kept-turn"], failedIds: ["kept-turn"], delegatedIds: ["kept-turn"] };
+    writeFileSync(pendingPath, JSON.stringify({ batches: [
+      { botId: bot.id, threadId: bot.threadId, turnIds: ["deleted-turn"] }, keptPending,
+    ] }));
 
     expect(await api(`/api/bots/${bot.id}`, "DELETE")).toEqual({ ok: true });
+    const upkeep = JSON.parse(readFileSync(statusPath, "utf8"));
+    expect(upkeep.bots[bot.id]).toBeUndefined();
+    expect(upkeep.bots[kept.id].lastTidy).toBeDefined();
+    expect(JSON.parse(readFileSync(pendingPath, "utf8")).batches).toEqual([keptPending]);
 
     expect(existsSync(journalPath)).toBe(false);
     expect(memoryRows(bot.id)).toBe(0);
