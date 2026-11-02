@@ -17,10 +17,20 @@ afterEach(() => {
 describe("ToolActivity in Simple mode", () => {
   it("names the step in plain words and keeps the tool's own name in the details", () => {
     const html = render({ name: "mcp__omb__computer_batch", ok: true, input: '{"actions":[]}' });
-    expect(html).toContain("Use the computer · Completed · Tool details");
-    expect(html).toMatch(/<span class="min-w-0 max-w-\[30rem\] truncate leading-5 font-medium">Use the computer<\/span>/);
+    expect(html).toContain("Use the screen · Completed · Tool details");
+    expect(html).toMatch(/<span class="min-w-0 max-w-\[30rem\] truncate leading-5 font-medium">Use the screen<\/span>/);
     expect(html).toContain('data-testid="tool-name"');
     expect(html).toContain("mcp__omb__computer_batch");
+  });
+
+  it("shows the line the harness wrote for an MCP server change, in both modes, with the tool's name in the details", () => {
+    const tool = { name: "mcp__agents__mcp_server", label: "Added MCP server linear · Turned on · Test: needs sign-in", ok: true };
+    for (const advanced of [false, true]) {
+      mode.advanced = advanced;
+      const html = render(tool);
+      expect(html, `advanced ${advanced}`).toContain("Added MCP server linear · Turned on · Test: needs sign-in · Completed · Tool details");
+      expect(html, `advanced ${advanced}`).toMatch(/data-testid="tool-name">mcp__agents__mcp_server</);
+    }
   });
 
   it("keeps a command off the row, where it reads as a plain step", () => {

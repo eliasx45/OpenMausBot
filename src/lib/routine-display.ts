@@ -12,7 +12,8 @@ export function latestRoutineRun(routineId: string, runs: readonly RoutineRun[])
 
 export function routineRunLabel(run: RoutineRun): string {
   if (run.goalStatus) return t(`routines.goal.${run.goalStatus}`);
-  return t(`routines.status.${run.status}`);
+  const status = t(`routines.status.${run.status}`);
+  return run.retried && run.status !== "queued" ? t(`routines.retried.${run.retried}`, { status }) : status;
 }
 
 export function routineRunTone(run: RoutineRun): string {
@@ -34,6 +35,11 @@ export function routineFinished(routine: Routine): boolean {
 export function routineScheduleState(routine: Routine): string {
   if (routineFinished(routine)) return t("routines.finishedSchedule");
   return routine.enabled ? t("routines.activeSchedule") : t("routines.pausedSchedule");
+}
+
+/** Why OpenMausBot keeps this routine paused, while it does (its owner left: shared/routines.ts RoutineHoldCause). */
+export function routineHeldNote(routine: Routine): string | null {
+  return routine.heldFor ? t(`routines.heldFor.${routine.heldFor}`) : null;
 }
 
 export function routineNextLabel(routine: Routine): string {

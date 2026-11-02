@@ -4,6 +4,7 @@ import { sameAudience } from "../bot-visibility.ts";
 import { sectionContextKey, sectionMemoryKey } from "../section-context.ts";
 import type { TeamMemory, TeamMemoryInput } from "../team-memory.ts";
 import { recordProjectEvidence, type EvidenceInput } from "../project-evidence.ts";
+import type { ProjectEvidence } from "../../shared/project-evidence.ts";
 
 export function createTeamMemoryActions(deps: {
   store: Pick<Store, "bot" | "groupByThread" | "taskByThread" | "appendMessage">;
@@ -29,7 +30,9 @@ export function createTeamMemoryActions(deps: {
         card: { title: "Remember this for the team?", subtitle: `${result.entry.name} — ${result.entry.detail}`, options: ["Remember", "Skip"], requestId: result.entry.id,
           tool: "propose_team_memory", teamMemoryRequest: { section: bot.section ?? "", entryId: result.entry.id, kind } } });
     },
-    async propose(input: TeamMemoryInput & { fromThreadId: string; evidence?: EvidenceInput }, from: BotRecord, assertActive: () => void, turnId?: string) {
+    /** Records an outcome's saved-project evidence, rechecks the turn and audience, then hands it to `submit`. */
+    async propose<R>(input: TeamMemoryInput & { fromThreadId: string; evidence?: EvidenceInput }, from: BotRecord, assertActive: () => void,
+      submit: (evidence: ProjectEvidence | undefined) => R): Promise<R> {
       const room = store.groupByThread(input.fromThreadId);
       const folderFor = () => room?.cwd ?? store.taskByThread(from.id, input.fromThreadId)?.cwd ?? from.cwd;
       const folder = folderFor();
@@ -39,7 +42,7 @@ export function createTeamMemoryActions(deps: {
       assertActive();
       if (sectionMemoryKey(from.section) !== key || !sameAudience(from.visibility, undefined) || (room && !deps.roomFeedsBot(room, from))) throw new Error("Team or audience changed while recording evidence; retry");
       if (input.evidence && folderFor() !== folder) throw new Error("Working folder changed while recording evidence; retry");
-      return deps.memory().propose(from.section, input, { botId: from.id, botName: from.name, threadId: input.fromThreadId, at: Date.now(), turnId }, evidence);
+      return submit(evidence);
     },
   };
 }

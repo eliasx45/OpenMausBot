@@ -116,6 +116,12 @@ function fromBase64url(value: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+/** The one spelling newState makes. The last character's two spare bits carry nothing, so "…A", "…B", "…C" and "…D"
+ * decode to the same bytes: only the canonical one may open a flow. */
+function canonicalState(state: string): boolean {
+  return STATE.test(state) && base64url(fromBase64url(state)) === state;
+}
+
 function hex(bytes: ArrayBuffer): string {
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -310,6 +316,19 @@ function expired(row: FlowRow, now: number): boolean {
   return row.created_at + HIGHLEVEL_FLOW_TTL_MS <= now;
 }
 
+/** Marks the flow as taken by this callback at `now`, or false when another callback, a claim or the TTL got there first. */
+async function takeForCallback(env: Env, lookup: string, now: number): Promise<boolean> {
+  const taken = await env.DB.prepare(
+    `UPDATE highlevel_flows SET callback_at = ?1
+     WHERE lookup = ?2 AND callback_at IS NULL AND ciphertext IS NULL AND claimed_at IS NULL AND created_at > ?3`,
+  ).bind(now, lookup, now - HIGHLEVEL_FLOW_TTL_MS).run();
+  return taken.meta.changes === 1;
+}
+
+function endTakenFlow(env: Env, lookup: string, now: number) {
+  return env.DB.prepare("DELETE FROM highlevel_flows WHERE lookup = ? AND callback_at = ?").bind(lookup, now).run();
+}
+
 /** HighLevel sends the person's browser here: a top-level GET with no Origin
  * header and no credential. Every answer is a fixed page; query values are
  * never echoed or logged. */
@@ -326,7 +345,7 @@ export async function highLevelCallback(
   if (limited) return limited;
   const url = new URL(request.url);
   const state = url.searchParams.get("state") ?? "";
-  if (!STATE.test(state)) return PAGES.expired();
+  if (!canonicalState(state)) return PAGES.expired();
   const lookup = await flowLookup(state);
   const row = await flowRow(env, lookup);
   if (!row || row.claimed_at !== null || row.ciphertext !== null || expired(row, now)) return PAGES.expired();
@@ -334,23 +353,26 @@ export async function highLevelCallback(
   if (url.searchParams.has("error")) {
     // The person declined, or HighLevel refused before issuing a code. The
     // flow ends here: a claim finds nothing and the harness times out cleanly.
-    await env.DB.prepare("DELETE FROM highlevel_flows WHERE lookup = ?").bind(lookup).run();
+    if (!(await takeForCallback(env, lookup, now))) return PAGES.expired();
+    await endTakenFlow(env, lookup, now);
     console.log(JSON.stringify({ message: "highlevel flow cancelled", requestId }));
     return PAGES.cancelled();
   }
   const code = url.searchParams.get("code") ?? "";
   if (!CODE.test(code)) return PAGES.failed();
 
+  if (!(await takeForCallback(env, lookup, now))) return PAGES.expired();
   const outcome = await exchange(config, { grant_type: "authorization_code", code }, highLevelFetch);
   if (outcome.kind !== "ok") {
     // The code is single-use: nothing to retry with, so the flow ends.
-    await env.DB.prepare("DELETE FROM highlevel_flows WHERE lookup = ?").bind(lookup).run();
+    await endTakenFlow(env, lookup, now);
     console.error(JSON.stringify({ message: "highlevel exchange failed", requestId, status: outcome.status, errorCode: "highlevel_exchange_failed" }));
     return PAGES.failed();
   }
   const stored = await env.DB.prepare(
-    "UPDATE highlevel_flows SET ciphertext = ? WHERE lookup = ? AND ciphertext IS NULL AND claimed_at IS NULL AND created_at > ?",
-  ).bind(await seal(state, outcome.payload), lookup, now - HIGHLEVEL_FLOW_TTL_MS).run();
+    `UPDATE highlevel_flows SET ciphertext = ?
+     WHERE lookup = ? AND callback_at = ? AND ciphertext IS NULL AND claimed_at IS NULL AND created_at > ?`,
+  ).bind(await seal(state, outcome.payload), lookup, now, now - HIGHLEVEL_FLOW_TTL_MS).run();
   if (stored.meta.changes === 0) return PAGES.expired();
   console.log(JSON.stringify({ message: "highlevel flow connected", requestId }));
   return PAGES.connected();
@@ -362,6 +384,7 @@ export async function claimHighLevelFlow(request: Request, env: Env): Promise<Re
   const now = Date.now();
   const limited = await takeLimit(request, env, "claim", HIGHLEVEL_CLAIM_LIMIT, now);
   if (limited) return limited;
+  if (!canonicalState(body.state)) return errorResponse(404, "highlevel_unknown_state");
   const lookup = await flowLookup(body.state);
   const row = await flowRow(env, lookup);
   if (!row || expired(row, now)) return errorResponse(404, "highlevel_unknown_state");

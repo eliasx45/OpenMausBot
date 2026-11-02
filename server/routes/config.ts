@@ -1,11 +1,12 @@
 import * as boat from "../boat.ts";
 import { boatCreateRecoverySnapshot, retireDeletedBoatCreate } from "../boat-create-idempotency.ts";
 import { boatDeletionSnapshot } from "../boat-delete-journal.ts";
-import { browserEngineStatus, browserSessionId, closeBrowserSession } from "../browser-engine.ts";
+import { browserEngineStatus, browserSessionId } from "../browser-engine.ts";
+import { browserEngineKind } from "../browser/config.ts";
 import type { BrowserCleanupCoordinator, BrowserCleanupRequest } from "../browser-lifecycle-cleanup.ts";
 import { finalizeBrowserCleanupMutation, requireBrowserCleanupAcknowledged } from "../browser-lifecycle-cleanup.ts";
 import type { BrowserLive } from "../browser-live.ts";
-import { browserRuntimeEnv, type BrowserRuntime } from "../browser-runtime.ts";
+import type { BrowserRuntime } from "../browser-runtime.ts";
 import { boatAccountResourceChangeError, vpsAliasResourceChangeError } from "../cloud-backend.ts";
 import { CLOUD_PERSONAL_REFUSAL } from "../cloud-owner.ts";
 import * as composio from "../composio.ts";
@@ -25,11 +26,12 @@ import {
   type AppConfig,
 } from "../config.ts";
 import type { InstanceConfigMap, ModelSelection } from "../contracts.ts";
-import { deciderIncludedHere, deciderPatchKey, deciderSavePatch, type Decider } from "../decider/index.ts";
+import type { RequestAuth } from "../request-auth.ts";
+import { DECIDER_KEY_REJECTED, deciderIncludedHere, deciderPatchKey, deciderSavePatch, deciderSharedKeyUsable, type Decider } from "../decider/index.ts";
 import type { ProviderRegistry } from "../harness/registry.ts";
 import { HOSTED_PROVIDER_SETTINGS_ERROR } from "../hosted-models.ts";
 import { forgetKey } from "../key-rejections.ts";
-import type { LocalVmIdleTimer } from "../local-vm-idle.ts";
+import type { ComputerIdleTimer } from "../computer-idle.ts";
 import { PROVIDER_KEY_KINDS } from "../provider-key-check.ts";
 import type { SessionRegistry } from "../sessions.ts";
 import type { SharedComputerControl } from "../shared-computer-control.ts";
@@ -38,6 +40,7 @@ import { parseSkillMd } from "../skills.ts";
 import type { Store } from "../store.ts";
 import * as tts from "../tts/index.ts";
 import * as vps from "../vps-computer.ts";
+import type { Postiz } from "../postiz/service.ts";
 import { PASS, type RouteHandler } from "./table.ts";
 
 export interface BusyFlag {
@@ -54,12 +57,15 @@ export type ConfigStatus = Record<string, unknown>;
 export interface ConfigRouteDeps {
   store: Pick<Store, "bots" | "patchBot" | "clearVoiceSelections">;
   cfg: AppConfig;
-  registry: Pick<ProviderRegistry, "get">;
+  registry: Pick<ProviderRegistry, "get" | "forgetSnapshots">;
   sessions: Pick<SessionRegistry, "revalidateEmailSessions">;
   browserCleanup: Pick<BrowserCleanupCoordinator, "hasPendingProfile" | "prepare" | "abort" | "commit" | "ensure">;
   browserLive: Pick<BrowserLive, "closeAll" | "closeForSession">;
   browserRuntime: Pick<BrowserRuntime, "heldBy">;
   usedBrowserSessions: Pick<Map<string, { command: string; env: Record<string, string> }>, "get" | "delete">;
+  closeBrowser(session: string, spec: { command: string; env: Record<string, string> }): Promise<boolean>;
+  /** After browserEngine.engine changed: closes the viewers and the browsers the other engine ran. */
+  browserEngineSwitched(): void;
   decider: Pick<Decider, "testKey">;
   sharedComputers: Pick<SharedComputers, "close">;
   sharedComputerControl: Pick<SharedComputerControl, "close">;
@@ -68,7 +74,7 @@ export interface ConfigRouteDeps {
   lendingEnabled(): boolean;
   providerConfigs(): InstanceConfigMap;
   localVmIdleMs(): number;
-  localVmIdles: { values(): Iterable<Pick<LocalVmIdleTimer, "setIdleMs">> };
+  localVmIdles: { values(): Iterable<Pick<ComputerIdleTimer, "setIdleMs">> };
   localVmActiveThreads: { readonly size: number };
   localVmLifecycleBusy: { readonly size: number };
   localVmImageBusy: Pick<BusyFlag, "get">;
@@ -82,32 +88,48 @@ export interface ConfigRouteDeps {
   policyModelRefusal(instance: { instanceId: string; driverKind: string }): string | undefined;
   browserSessionSpec(binaryPath: string, session: string, profile: string | undefined): { command: string; env: Record<string, string> };
   configStatus(): ConfigStatus;
-  configForAccess(status: ConfigStatus, admin: boolean): unknown;
+  /** What this caller is shown: a client sees configured-or-not only; on a Team Cloud the profile is the caller's own. */
+  configForAccess(status: ConfigStatus, auth: RequestAuth): unknown;
+  /** A Team Cloud only: Settings → Profile saves the signed-in person's own profile, never the server's. False: nobody
+   * signed in to save it for. */
+  ownProfile?(auth: RequestAuth, profile: { name?: string; avatarUrl?: string; aboutMe?: string }): boolean;
   resyncOpenCodeProviderKeys(): void;
   revokeEngineCapabilities(engines: ReadonlySet<string>): void;
   reloadProviders(before: Record<string, unknown>): Promise<void>;
   broadcast(payload: Record<string, unknown>): void;
   drainQueuedSends(): void;
+  /** Postiz: a key is checked at its address before it is saved, and the `postiz` server follows the saved key. */
+  postiz?: Pick<Postiz, "configCheck" | "configSaved">;
 }
 
 export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
   const {
     store, cfg, registry, sessions, browserCleanup, browserLive, browserRuntime, usedBrowserSessions, decider,
-    sharedComputers, sharedComputerControl, hostedModels, cloudHome: CLOUD_HOME, lendingEnabled, providerConfigs,
+    closeBrowser, browserEngineSwitched, sharedComputers, sharedComputerControl, hostedModels, cloudHome: CLOUD_HOME, lendingEnabled, providerConfigs,
     localVmIdleMs, localVmIdles, localVmActiveThreads, localVmLifecycleBusy, localVmImageBusy, localVmModeChangeBusy,
     providerConfigBusy, computerProviderConfigTransitions, managedBoatOwners, providerOperationConflict,
     perBotLocalVmCountForModeChange, checkedModelSelection, policyModelRefusal, browserSessionSpec, configStatus,
-    configForAccess, resyncOpenCodeProviderKeys, revokeEngineCapabilities, reloadProviders, broadcast, drainQueuedSends,
+    configForAccess, resyncOpenCodeProviderKeys, revokeEngineCapabilities, reloadProviders, broadcast, drainQueuedSends, ownProfile, postiz,
   } = deps;
   return async ({ req, res, url, path, method, auth, json, readBody }) => {
     // API keys are never echoed back: booleans only.
     if (method === "GET" && path === "/api/config") {
-      return json(res, 200, configForAccess(configStatus(), auth.scopes.includes("admin")));
+      return json(res, 200, configForAccess(configStatus(), auth));
     }
     if ((method === "PUT" || method === "PATCH") && path === "/api/config") {
       const body = await readBody(req);
-      if (hostedModels && ["instances", "anthropic", "openai", "openrouter", "openaiCompat", "xai", "mistral", "cerebras", "groq", "meta", "opencodeGo"].some(key => Object.hasOwn(body, key))) return json(res, 403, { error: HOSTED_PROVIDER_SETTINGS_ERROR });
+      if (hostedModels && ["instances", "anthropic", "openai", "openrouter", "openaiCompat", "xai", "mistral", "cerebras", "groq", "greenference", "meta", "opencodeGo"].some(key => Object.hasOwn(body, key))) return json(res, 403, { error: HOSTED_PROVIDER_SETTINGS_ERROR });
       const patch = parseConfigPatch(body);
+      if (patch.profile && ownProfile) {
+        // The address is the verified claim's; a profile names no other.
+        const { email: _email, ...own } = patch.profile;
+        if (!ownProfile(auth, own)) return json(res, 403, { error: "Sign in to this team to have a profile." });
+        delete patch.profile;
+        if (!Object.keys(patch).length) {
+          broadcast({ kind: "config", ...configStatus() });
+          return json(res, 200, configForAccess(configStatus(), auth));
+        }
+      }
       if (CLOUD_HOME && (patch.signIn?.admins?.length || patch.signIn?.members?.length)) {
         return json(res, 403, { error: CLOUD_PERSONAL_REFUSAL, code: "cloud_personal" });
       }
@@ -137,7 +159,7 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
       }
       if (!Object.keys(patch).length) return json(res, 400, { error: "nothing to save" });
       if (patch.decider) {
-        const planned = deciderSavePatch(patch.decider, cfg.decider, deciderIncludedHere());
+        const planned = deciderSavePatch(patch.decider, cfg.decider, { included: deciderIncludedHere(), shared: deciderSharedKeyUsable(cfg) });
         if (!planned.ok) return json(res, 400, { error: planned.error });
         patch.decider = planned.patch;
       }
@@ -155,6 +177,7 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
         }
       }
       const disablingBuiltInBrowser = patch.features?.browser === false && builtInBrowserEnabled(cfg);
+      const switchingBrowserEngine = patch.browserEngine?.engine !== undefined && patch.browserEngine.engine !== browserEngineKind(cfg);
       const removedBrowserProfileIds = patch.browserProfiles === undefined
         ? []
         : (cfg.browserProfiles ?? [])
@@ -341,10 +364,12 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
           patch.composio = { ...patch.composio, apiKey: "", sessionId: "" };
         }
       }
+      const postizRefusal = await postiz?.configCheck(patch);
+      if (postizRefusal) return json(res, postizRefusal.status, { error: postizRefusal.error, code: postizRefusal.code });
       const newBoatToken = patch.box?.token;
       if (newBoatToken?.trim()) {
         const check = await boat.verifyToken(newBoatToken);
-        if (!check.ok) return json(res, 400, { error: check.message });
+        if (!check.ok) return json(res, 400, { error: check.message, ...(check.rejected ? { code: "key_rejected" } : {}) });
       }
       if (replacingRejectedBoatToken) {
         // An expired credential cannot authorize its own replacement: probe without adopting or retiring identities.
@@ -427,9 +452,7 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
       if (deciderKey) {
         const check = await decider.testKey(deciderKey.check);
         if (!check.ok && check.reason === "rejected") {
-          const error = deciderKey.provider === "openrouter"
-            ? "OpenRouter rejected this key. Check it at openrouter.ai/keys and paste it again."
-            : "Jev rejected this key. Check it at typesafe.ai and paste it again.";
+          const error = DECIDER_KEY_REJECTED[deciderKey.provider];
           return json(res, 400, { error, code: "decider_rejected" });
         }
       }
@@ -447,6 +470,8 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
         const switching = store.bots.find((bot) => bot.busy && bot.browserProfile && browserChoiceChanged.includes(bot.browserProfile));
         if (switching) return json(res, 409, { error: `stop ${switching.name}'s turn before changing its browser` });
       }
+      const browsing = switchingBrowserEngine ? store.bots.find((bot) => bot.busy && bot.browser !== false) : undefined;
+      if (browsing) return json(res, 409, { error: `stop ${browsing.name}'s turn before switching the browser` });
       // Observed again after the awaits: catches an operation that already held a claim.
       for (const provider of transitioningProviders) {
         const conflict = providerOperationConflict(provider);
@@ -477,12 +502,13 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
         return next === undefined ? [] : [cfg[kind]?.key, next];
       });
       const engineForSwitch = browserEngineStatus();
-      const browsersToClose = engineForSwitch.kind === "ready" ? browserChoiceChanged.flatMap((id) => {
+      const browsersToClose = browserChoiceChanged.flatMap((id) => {
         const target = browserProfilePartitionTarget(cfg, id);
         if (!target) return [];
         const session = browserSessionId("", target.partitionId);
-        return [{ session, spec: usedBrowserSessions.get(session) ?? browserSessionSpec(engineForSwitch.binaryPath, session, id) }];
-      }) : [];
+        const spec = usedBrowserSessions.get(session) ?? (engineForSwitch.kind === "ready" ? browserSessionSpec(engineForSwitch.binaryPath, session, id) : null);
+        return spec ? [{ session, spec }] : [];
+      });
       let configWriteCommitted = false;
       const enginesBefore = engineLaunches(providerConfigs());
       const externalSecretStorage = url.searchParams.get("secretStorage") === "external";
@@ -500,9 +526,12 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
           if (persisted.tts?.fishKey !== undefined) persisted.tts.fishKey = "";
           if (persisted.decider?.key !== undefined) persisted.decider.key = "";
           if (persisted.decider?.openrouterKey !== undefined) persisted.decider.openrouterKey = "";
+          if (persisted.decider?.workersAiToken !== undefined) persisted.decider.workersAiToken = "";
           if (persisted.imageGen?.key !== undefined) persisted.imageGen.key = "";
           if (persisted.imageGen?.customApiKey !== undefined) persisted.imageGen.customApiKey = "";
           if (persisted.live?.key !== undefined) persisted.live.key = "";
+          if (persisted.treg?.key !== undefined) persisted.treg.key = "";
+          if (persisted.postiz?.key !== undefined) persisted.postiz.key = "";
           saveConfig(persisted);
           configWriteCommitted = true;
           syncCredentialEnv(patch);
@@ -526,6 +555,9 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
         throw error;
       }
       for (const key of resetKeys) if (key) forgetKey(key);
+      postiz?.configSaved(patch);
+      // A saved key reaches an engine through the environment its status read uses, often with no reload.
+      registry.forgetSnapshots();
       if (patch.localVm?.idleTimeoutMinutes !== undefined) {
         for (const idle of localVmIdles.values()) idle.setIdleMs(localVmIdleMs());
       }
@@ -539,13 +571,14 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
         sharedComputerControl.close();
       }
       if (disablingBuiltInBrowser) browserLive.closeAll();
+      if (switchingBrowserEngine) browserEngineSwitched();
       for (const request of browserCleanupRequests) {
         if (request.kind === "profile") browserLive.closeForSession(browserSessionId("", request.partitionId));
       }
       for (const { session, spec } of browsersToClose) {
         browserLive.closeForSession(session);
         usedBrowserSessions.delete(session);
-        void closeBrowserSession(spec.command, browserRuntimeEnv({ ...spec.env, AGENT_BROWSER_SESSION: session })).then((closed) => {
+        void closeBrowser(session, spec).then((closed) => {
           if (!closed) console.warn(`browser ${session}: could not close it after its browser changed; the next turn may still use the old one`);
         });
       }
@@ -600,7 +633,7 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
         finalized.acknowledgements.every(Boolean),
         removedBrowserProfileIds.length === 1 ? "The browser profile" : "The browser profiles",
       );
-      return json(res, 200, finalized.value);
+      return json(res, 200, configForAccess(finalized.value, auth));
       } finally {
         for (const provider of transitioningProviders) computerProviderConfigTransitions.delete(provider);
         if (changingLocalVmMode) localVmModeChangeBusy.set(false);

@@ -30,7 +30,7 @@ type Props = { children?: ReactNode; onClick?: () => void; disabled?: boolean; [
 function nodes(value: ReactNode): ReactElement<Props>[] {
   return Children.toArray(value).flatMap((child) => isValidElement<Props>(child) ? [child, ...nodes(child.props.children)] : []);
 }
-const skill = (name = "order-audit"): SkillsLibrarySkillWire => ({ name, description: "Audit orders", source: "local-import", enabled: false, tags: [], version: null, importedAt: "2026-10-02T00:00:00Z", warnings: [], assignedBots: [] });
+const skill = (name = "order-audit"): SkillsLibrarySkillWire => ({ name, description: "Audit orders", source: "local-import", enabled: false, everyBot: false, tags: [], version: null, importedAt: "2026-10-02T00:00:00Z", warnings: [], assignedBots: [] });
 const source = "---\nname: order-audit\ndescription: Audit orders\n---\n\nCheck every line item.";
 const response = (body: unknown, ok = true) => ({ ok, json: async () => body });
 function render(bot = false) {
@@ -73,6 +73,15 @@ describe("Skills library review and assignment controls", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("makes a reviewed skill available to every bot from the library", async () => {
+    named(render(), "Every bot").props.onClick!();
+    await flush();
+    expect(fetch).toHaveBeenCalledWith("/api/skills-library/order-audit", expect.objectContaining({
+      method: "PATCH",
+      body: '{"everyBot":true}',
+    }));
+  });
+
   it("blocks a simultaneous second assignment and reads current assignments before the next PUT", async () => {
     const rows = [skill("alpha"), skill("beta")];
     fixture.values[0] = rows;
@@ -113,5 +122,17 @@ describe("Skills library review and assignment controls", () => {
     (review.props.onEnable as () => void)();
     await flush();
     expect(fixture.request).toHaveBeenCalledWith("/api/skills-library/order-audit", expect.objectContaining({ method: "PATCH", body: '{"enabled":true}' }));
+  });
+
+  it("shows a skill from this computer with this bot's switch, and no way to delete the one copy every bot shares", async () => {
+    const imported = { name: "pdf", description: "Works with PDFs", enabled: true, source: "~/.claude/skills/pdf", warnings: [], origin: "imported" };
+    fixture.values = [[imported], [], [], "", [], false, "", "", null, { current: false }, null, "", false, ""];
+    fixture.request.mockImplementation(async (_url, options) => options?.method ? {} : { text: source });
+    const tree = render(true);
+    expect(tree.find((node) => node.props["aria-label"] === "Remove pdf")).toBeUndefined();
+    expect(tree.some((node) => node.props.children === "this computer")).toBe(true);
+    named(tree, "Disable pdf").props.onClick!();
+    await flush();
+    expect(fixture.request).toHaveBeenCalledWith("/api/bots/bot/skills/pdf", expect.objectContaining({ method: "PATCH", body: '{"enabled":false}' }));
   });
 });

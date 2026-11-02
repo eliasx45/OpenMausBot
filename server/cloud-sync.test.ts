@@ -87,7 +87,7 @@ it("answers 410 when a folder's copy is gone, and can delete a folder's copy to 
   expect(await status(() => sync.files(folder.id))).toBe(410);
   mkdirSync(folder.cloudPath);
   writeFileSync(join(folder.cloudPath, "b.txt"), "bye");
-  sync.unregister(folder.id, false);
+  await sync.unregister(folder.id, false);
   expect(existsSync(folder.cloudPath)).toBe(false);
   expect(sync.trash().entries.map((entry) => entry.path)).toEqual(["b.txt"]);
   expect(sync.summary().folders).toEqual([]);
@@ -159,7 +159,8 @@ it("a copy from the person's computer is read-only for bots", async () => {
   expect(readFileSync(join(folder.cloudPath, "brief.md"), "utf8")).toBe("v2");
 });
 
-it("answers 503 for a folder part or a file it cannot read, rather than leaving it out of the listing", async () => {
+// chmod cannot make a file unreadable on Windows (no POSIX mode bits), so this case is POSIX-only.
+it.skipIf(process.platform === "win32")("answers 503 for a folder part or a file it cannot read, rather than leaving it out of the listing", async () => {
   const { sync, folder } = setup();
   await put(sync, folder.id, "sub/a.txt", "one", null);
   await put(sync, folder.id, "b.txt", "two", null);
@@ -191,7 +192,7 @@ it("restores into a bot folder that emptied, and into a folder no longer synced"
   expect(await sync.restore(botEntry!.id)).toEqual({ folderId: "bot-owl-t1", path: "report.md" });
   expect(readFileSync(join(output, "report.md"), "utf8")).toBe("# Q3");
   await put(sync, folder.id, "a.txt", "keep", null);
-  sync.unregister(folder.id, false);
+  await sync.unregister(folder.id, false);
   const entry = sync.trash().entries.find((item) => item.path === "a.txt")!;
   await sync.restore(entry.id);
   expect(readFileSync(join(folder.cloudPath, "a.txt"), "utf8")).toBe("keep");
@@ -202,7 +203,7 @@ it("turning off with delete trashes synced files, keeps what sync never carried,
   await put(sync, folder.id, "a.txt", "synced", null);
   mkdirSync(join(folder.cloudPath, ".git"));
   writeFileSync(join(folder.cloudPath, ".git", "HEAD"), "ref: main");
-  sync.unregister(folder.id, false);
+  await sync.unregister(folder.id, false);
   expect(existsSync(join(folder.cloudPath, "a.txt"))).toBe(false);
   expect(readFileSync(join(folder.cloudPath, ".git", "HEAD"), "utf8")).toBe("ref: main");
   const other = sync.register({ computerId: PC, computerName: "Ash-PC", pcPath: "C:\\Users\\Ash\\Other", name: "Other" });
@@ -211,7 +212,7 @@ it("turning off with delete trashes synced files, keeps what sync never carried,
   writeFileSync(join(outside, "x.txt"), "not synced");
   rmSync(other.cloudPath, { recursive: true });
   symlinkSync(outside, other.cloudPath);
-  sync.unregister(other.id, false);
+  await sync.unregister(other.id, false);
   expect(readFileSync(join(outside, "x.txt"), "utf8")).toBe("not synced");
 });
 
