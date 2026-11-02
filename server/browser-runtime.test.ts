@@ -1,9 +1,11 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join, posix, win32 } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { addHeldSecretScrubber, HELD_SECRET_MASK } from "../shared/redact.ts";
+import { BROWSER_VIEWPORT } from "./browser-page-size.ts";
 import { BROWSER_CALL_DEFAULTS, BROWSER_HOVER_TOOL, BROWSER_RESTART_TOOL, BROWSER_UPLOAD_TOOL, BrowserRuntime, TransportError, browserRuntimeEnv, formatBrowserTiming, type BrowserSpawnSpec, type BrowserTiming } from "./browser-runtime.ts";
+import { launchSettingsKey } from "./browser-launch-key.ts";
 import { HARNESS_CALL_BUDGET_MS, HARNESS_PROXY_TIMEOUT_MS } from "./harness-budget.ts";
 import { RelayPorts } from "./browser-relay.ts";
 import { BrowserSteps, type StepCall, type StepContext } from "./browser-steps.ts";
@@ -210,6 +212,7 @@ lines.on('line', line => {
   // BUSY_FILE models agent-browser's one daemon per session, shared by every
   // MCP process: a hung command keeps it busy, and a read waits behind it.
   else if (m.params.name === 'hang') { if (process.env.BUSY_FILE) fs.writeFileSync(process.env.BUSY_FILE, 'busy'); return; }
+  else if (m.params.name === 'agent_browser_get_url' && process.env.NO_URL === '1') result = { isError:true, content:[] };
   else if (m.params.name === 'agent_browser_get_url') {
     const answer = () => process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result:{content:[{type:'text',text:'http://fixture.test/after'}]}})+'\\n');
     const wait = () => process.env.BUSY_FILE && fs.existsSync(process.env.BUSY_FILE) ? setTimeout(wait, 20) : answer();
@@ -253,6 +256,22 @@ function daemonSpec(): { spec: BrowserSpawnSpec; busy: string; calls: () => stri
 }
 
 describe("server-owned browser MCP runtime", () => {
+  it.runIf(process.platform === "linux")("starts a bot's browser engine first in line when memory runs out, before the server", async () => {
+    const value = runtime();
+    const listed = await value.agentRpc("scored", spec(), "tools/list", {}) as { pid: number };
+    expect(readFileSync(`/proc/${listed.pid}/oom_score_adj`, "utf8").trim()).toBe("1000");
+  });
+
+  it("never lets agent_browser_read fetch an address itself, around the browser and its egress gate", async () => {
+    const value = runtime();
+    const daemon = spec();
+    const refused = await value.agentRpc("reader", daemon, "tools/call", { name: "agent_browser_read", arguments: { url: "http://127.0.0.1:8799/api/config" } }) as { isError?: boolean; content: Array<{ text?: string }> };
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]!.text).toMatch(/Open the address with agent_browser_open first/);
+    const reads = await value.agentRpc("reader", daemon, "tools/call", { name: "agent_browser_read", arguments: {} }) as { isError?: boolean };
+    expect(reads.isError).not.toBe(true);
+  });
+
   it("hands no held secret back to the bot: snapshot, eval, page text, console and network results are all scrubbed", async () => {
     const leaked = "fake-filled-Passw0rd";
     // The default scrubber is the server's registry (shared/redact.ts), as in production.
@@ -623,7 +642,7 @@ describe("server-owned browser MCP runtime", () => {
     expect(next.content[0].text).not.toMatch(/are kept/);
   });
 
-  it("never closes a browser in use: a bot's call, a person's hold or input, an open live view", async () => {
+  it("never closes a browser in use: a bot's call, a person's hold or input", async () => {
     const closeBrowser = vi.fn(async () => true);
     const value = runtime({ closeBrowser });
     await value.agentRpc("s", spec(), "tools/list", {});
@@ -645,12 +664,31 @@ describe("server-owned browser MCP runtime", () => {
     expect(await idle()).toBe(false);
     typed.resolve();
     await human;
-    const unwatch = value.watch("s", spec());
-    expect(await idle()).toBe(false);
-    unwatch();
     expect(await value.closeIfIdle("s", 10)).toBe(false);
     expect(closeBrowser).not.toHaveBeenCalled();
     expect(await idle()).toBe(true);
+  });
+
+  it("closes a browser people only watch once it sat unused since the view opened, telling its views first, and never the person's own Chrome", async () => {
+    const order: string[] = [];
+    const closeBrowser = vi.fn(async (session: string) => { order.push(`close ${session}`); return true; });
+    const value = runtime({ closeBrowser });
+    value.onIdleClose((session) => order.push(`views ${session}`));
+    await value.agentRpc("s", spec(), "tools/call", { name: "echo" });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const unwatch = value.watch("s", spec());
+    expect(await value.closeIfIdle("s", 10)).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(await value.closeIfIdle("s", 10)).toBe(true);
+    expect(order).toEqual(["views s", "close s"]);
+    unwatch();
+    const mine = { ...spec(), env: { ...spec().env, AGENT_BROWSER_CDP: "9333" } };
+    await value.agentRpc("mine", mine, "tools/call", { name: "echo" });
+    const unwatchMine = value.watch("mine", mine);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(await value.closeIfIdle("mine", 10, mine)).toBe(false);
+    unwatchMine();
+    expect(order).toEqual(["views s", "close s"]);
   });
 
   it("makes a call that arrives while its idle browser closes wait, then open it again", async () => {
@@ -724,12 +762,82 @@ describe("server-owned browser MCP runtime", () => {
     order.push(first.content[0]!.text);
     await value.agentRpc("s", spec(), "tools/call", { name: "echo", arguments: { text: "second" } });
     expect(applyViewport).toHaveBeenCalledOnce();
-    expect(applyViewport).toHaveBeenCalledWith(spec());
+    expect(applyViewport).toHaveBeenCalledWith(spec(), BROWSER_VIEWPORT);
     expect(order[0]).toBe("viewport");
     expect(order[1]).toContain("first");
     await value.close("s");
     await value.agentRpc("s", spec(), "tools/call", { name: "echo" });
     expect(applyViewport).toHaveBeenCalledTimes(2);
+  });
+
+  it("sizes the page for the panel a person watches once the bot's call ends, and back to the standard page at the bot's next call after they leave", async () => {
+    const sizes: Array<{ width: number; height: number }> = [];
+    const value = runtime({ applyViewport: async (_spec, size) => { sizes.push(size); } });
+    await value.agentRpc("s", spec(), "tools/call", { name: "echo" });
+    expect(sizes).toEqual([BROWSER_VIEWPORT]);
+    const unwatch = value.watch("s", spec());
+    const typing = deferred<{ ok: boolean; text: string }>();
+    const holding = value.withSecretInput("s", spec(), () => typing.promise);
+    const resizing = value.pageSizes.resize("s", { width: 400, height: 750 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sizes).toEqual([BROWSER_VIEWPORT]);
+    typing.resolve({ ok: true, text: "typed" });
+    await holding;
+    await resizing;
+    expect(sizes).toEqual([BROWSER_VIEWPORT, { width: 1280, height: 2400 }]);
+    const shot = await value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_screenshot", arguments: {} }) as { content: Array<{ text: string }> };
+    expect(sizes).toHaveLength(2);
+    expect(JSON.parse(shot.content[0]!.text)).toMatchObject({ name: "agent_browser_screenshot", arguments: { format: "jpeg", quality: 80 } });
+    unwatch();
+    await value.pageSizes.resize("s", null);
+    expect(sizes).toHaveLength(2);
+    await value.agentRpc("s", spec(), "tools/call", { name: "echo" });
+    expect(sizes).toEqual([BROWSER_VIEWPORT, { width: 1280, height: 2400 }, BROWSER_VIEWPORT]);
+  });
+
+  it("prepares the browser before the engine may start it, and gives it its identity before the bot's command runs", async () => {
+    const order: string[] = [];
+    const launch = {
+      ready: vi.fn(async () => { order.push("ready"); }),
+      started: vi.fn(async () => { order.push("started"); }),
+      stopped: vi.fn(),
+    };
+    const value = runtime({ launch, applyViewport: async () => { order.push("viewport"); } });
+    await value.agentRpc("s", spec(), "tools/list", {});
+    expect(order).toEqual([]);
+    const result = await value.agentRpc("s", spec(), "tools/call", { name: "echo", arguments: { text: "go" } }) as { content: Array<{ text: string }> };
+    order.push(result.content[0]!.text.includes("go") ? "command" : "?");
+    expect(order).toEqual(["ready", "viewport", "started", "command"]);
+    expect(launch.started).toHaveBeenCalledWith("s", spec());
+    await value.agentRpc("s", spec(), "tools/call", { name: "agent_browser_close", arguments: {} });
+    expect(launch.started).toHaveBeenCalledOnce();
+    expect(launch.ready).toHaveBeenCalledTimes(2);
+  });
+
+  it("answers a call with the launcher's reason while the browser cannot start yet, without starting the engine", async () => {
+    const launch = { ready: vi.fn(async () => { throw new Error("Getting the browser ready (52 of 182 MB). Try again in a minute."); }), started: vi.fn(), stopped: vi.fn() };
+    const value = runtime({ launch });
+    const missing: BrowserSpawnSpec = { command: join(tmpdir(), "no-such-engine"), args: [], env: {} };
+    await expect(value.agentRpc("s", missing, "tools/call", { name: "agent_browser_open", arguments: { url: "https://example.com" } }))
+      .rejects.toThrow("Getting the browser ready (52 of 182 MB). Try again in a minute.");
+    expect(value.interrupted("s")).toBe(false);
+    expect(launch.started).not.toHaveBeenCalled();
+  });
+
+  it("still runs the bot's command when the browser's identity cannot be attached", async () => {
+    const launch = { ready: async () => {}, started: async () => { throw new Error("no DevTools address"); }, stopped: vi.fn() };
+    await expect(runtime({ launch }).agentRpc("s", spec(), "tools/call", { name: "echo", arguments: { text: "works" } })).resolves.toMatchObject({ content: [{ type: "text" }] });
+  });
+
+  it("lets the launcher drop a browser's identity connection whenever the browser is closed", async () => {
+    const stopped = vi.fn();
+    const value = runtime({ launch: { ready: async () => {}, started: async () => {}, stopped }, closeBrowser: async () => true });
+    await value.agentRpc("s", spec(), "tools/call", { name: "echo" });
+    await value.agentRpc("s", spec(), "tools/call", { name: "restart_browser" });
+    expect(stopped).toHaveBeenLastCalledWith("s");
+    await value.restart("s", "person", async () => {});
+    await value.close("s");
+    expect(stopped).toHaveBeenCalledTimes(3);
   });
 
   it("times each bot call by phase, and the preview frame that held the engine", async () => {
@@ -909,6 +1017,100 @@ describe("server-owned browser MCP runtime", () => {
     } finally {
       try { process.kill(first.browserPid, "SIGKILL"); } catch {}
     }
+  });
+});
+
+describe("browser launch settings", () => {
+  const basePath = process.env.PATH ?? "/usr/bin:/bin";
+  const joined = (...entries: string[]) => entries.join(delimiter);
+  const fnm = (id: string) => `/Users/person/.local/state/fnm_multishells/${id}/bin`;
+
+  it("keeps the running browser when only fnm's per-shell PATH link changes", async () => {
+    const value = runtime();
+    const first = spec();
+    first.env.PATH = joined(fnm("4101_1793469937867"), basePath);
+    const started = await value.agentRpc("fnm", first, "tools/list", {}) as { pid: number };
+    const replaced: BrowserSpawnSpec = { ...first, env: { ...first.env, PATH: joined(fnm("4102_1793470001123"), basePath) } };
+    expect((await value.agentRpc("fnm", replaced, "tools/list", {}) as { pid: number }).pid).toBe(started.pid);
+    // A re-probed PATH keeps the link it captured before and appends the one it read now.
+    const accumulated: BrowserSpawnSpec = { ...first, env: { ...first.env, PATH: joined(fnm("4101_1793469937867"), fnm("4103_1793470009999"), basePath) } };
+    expect((await value.agentRpc("fnm", accumulated, "tools/list", {}) as { pid: number }).pid).toBe(started.pid);
+  });
+
+  it("still refuses a call whose launch settings really changed", async () => {
+    const value = runtime();
+    const first = spec();
+    first.env.PATH = basePath;
+    await value.agentRpc("changed", first, "tools/list", {});
+    const changes: Array<[string, BrowserSpawnSpec]> = [
+      ["command", { ...first, command: `${process.execPath}-other` }],
+      ["args", { ...first, args: [...first.args, "--headed"] }],
+      ["executable", { ...first, env: { ...first.env, AGENT_BROWSER_EXECUTABLE_PATH: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" } }],
+      ["profile", { ...first, env: { ...first.env, AGENT_BROWSER_PROFILE: "/tmp/omb-profile-b" } }],
+      ["restore", { ...first, env: { ...first.env, AGENT_BROWSER_RESTORE: "omb-other" } }],
+      ["proxy", { ...first, env: { ...first.env, AGENT_BROWSER_PROXY: "socks5://127.0.0.1:64123" } }],
+      ["headless", { ...first, env: { ...first.env, AGENT_BROWSER_HEADLESS: "0" } }],
+      ["a PATH directory", { ...first, env: { ...first.env, PATH: joined("/opt/homebrew/bin", basePath) } }],
+    ];
+    for (const [name, changed] of changes) {
+      await expect(value.agentRpc("changed", changed, "tools/list", {}), name).rejects.toThrow(/launch settings changed/);
+    }
+  });
+
+  it("keys the Node version fnm selects in both PATH forms", () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-fnm-"));
+    try {
+      const state = join(root, "state", "fnm_multishells");
+      const install = (version: string) => {
+        const dir = join(root, "node-versions", version, "installation");
+        mkdirSync(join(dir, "bin"), { recursive: true });
+        return dir;
+      };
+      const link = (id: string, target: string) => {
+        mkdirSync(state, { recursive: true });
+        const path = join(state, id);
+        symlinkSync(target, path, process.platform === "win32" ? "junction" : undefined);
+        return path;
+      };
+      const older = install("v20.18.0");
+      const newer = install("v22.12.0");
+      const firstLink = link("4101_1793469937867", older);
+      const secondLink = link("4102_1793470001123", older);
+      const upgradeLink = link("4103_1793470009999", newer);
+      // Unix puts the link's bin on PATH, Windows the link itself.
+      const forms = [(path: string) => join(path, "bin"), (path: string) => path];
+      for (const onPath of forms) {
+        const key = (...entries: string[]) => launchSettingsKey({ command: "chrome", args: [], env: { PATH: entries.join(delimiter) } });
+        expect(key(onPath(firstLink), "/usr/bin")).toBe(key(onPath(secondLink), "/usr/bin"));
+        expect(key(onPath(firstLink), "/usr/bin")).not.toBe(key(onPath(upgradeLink), "/usr/bin"));
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("leaves ordinary PATH entries exactly as they were", () => {
+    const key = (path: string) => launchSettingsKey({ command: "chrome", args: [], env: { PATH: path } });
+    const path = joined("/usr/bin", "/bin");
+    expect(key(path)).toBe(JSON.stringify(["chrome", [], [["PATH", path]]]));
+    expect(key(path)).not.toBe(key(joined("/usr/bin", "/usr/bin", "/bin")));
+    expect(key(path)).not.toBe(key(joined("/bin", "/usr/bin")));
+  });
+
+  it("treats an fnm link that is already gone as one stable entry", () => {
+    // Literal paths so the case reads the same on every host: the link cannot resolve either way.
+    const forms: Array<[NodeJS.Platform, (id: string) => string]> = [
+      ["darwin", (id) => `/nowhere/fnm_multishells/${id}/bin`],
+      ["win32", (id) => `/nowhere/fnm_multishells/${id}`],
+    ];
+    for (const [platform, entry] of forms) {
+      const separator = (platform === "win32" ? win32 : posix).delimiter;
+      const key = (id: string) => launchSettingsKey({ command: "chrome", args: [], env: { PATH: [entry(id), "/usr/bin"].join(separator) } }, platform);
+      expect(key("1_1"), platform).toBe(key("2_2"));
+    }
+  });
+
+  it("does not fold a directory below the link into the link's target", () => {
+    const key = (id: string) => launchSettingsKey({ command: "chrome", args: [], env: { PATH: joined(`/nowhere/fnm_multishells/${id}/bin/extra`, "/usr/bin") } });
+    expect(key("1_1")).not.toBe(key("2_2"));
   });
 });
 
@@ -1202,6 +1404,69 @@ describe("around each bot call (browser-steps.ts)", () => {
     await expect(value.agentRpc("s", spec(), "tools/call", { name: "echo" }, undefined, ctx))
       .resolves.toMatchObject({ content: [{ text: expect.stringContaining("earlier echo call that did not answer has ended") }] });
     expect(value.interrupted("s")).toBe(false);
+  });
+});
+
+describe("a password fill_login left on a page", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const filled = (held: { url: string; ms: number; clear?: () => Promise<void> }) => async () => ({ ok: true, text: "Filled the password.", filled: ["password"], held });
+  const evaluate = (value: BrowserRuntime, daemon: { spec: BrowserSpawnSpec }) =>
+    value.agentRpc("s", daemon.spec, "tools/call", { name: "agent_browser_eval", arguments: { script: "document.querySelector('input').value" } }) as Promise<{ isError?: boolean; content: Array<{ text: string }> }>;
+
+  it("refuses eval on that page while its address is unchanged, keeps the other tools, and lets eval run once the page moved", async () => {
+    const value = runtime();
+    const daemon = daemonSpec();
+    try {
+      await value.withSecretInput("s", daemon.spec, filled({ url: "http://fixture.test/after#step", ms: 60_000 }));
+      const refused = await evaluate(value, daemon);
+      expect(refused).toEqual({ isError: true, content: [{ type: "text", text: expect.stringMatching(/^A saved password was just filled on this page, so agent_browser_eval is refused here/u) }] });
+      expect(daemon.calls()).toEqual(["agent_browser_get_url"]);
+      await expect(value.agentRpc("s", daemon.spec, "tools/call", { name: "agent_browser_snapshot", arguments: {} })).resolves.not.toMatchObject({ isError: true });
+      await value.withSecretInput("s", daemon.spec, filled({ url: "http://fixture.test/login", ms: 60_000 }));
+      expect((await evaluate(value, daemon)).isError).toBeUndefined();
+      expect(daemon.calls().filter((call) => call === "agent_browser_eval")).toHaveLength(1);
+      expect((await evaluate(value, daemon)).isError).toBeUndefined();
+    } finally { daemon.cleanup(); }
+  });
+
+  it("lets eval run again after the hold when the form was submitted, and refuses it when the page's address cannot be read", async () => {
+    const value = runtime();
+    const daemon = daemonSpec();
+    try {
+      await value.withSecretInput("s", daemon.spec, filled({ url: "http://fixture.test/after", ms: 60_000 }));
+      expect((await evaluate(value, daemon)).isError).toBe(true);
+      const later = Date.now() + 61_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => later);
+      try { expect((await evaluate(value, daemon)).isError).toBeUndefined(); } finally { clock.mockRestore(); }
+      daemon.spec.env.NO_URL = "1";
+      const unreadable = runtime();
+      await unreadable.withSecretInput("s", daemon.spec, filled({ url: "http://fixture.test/elsewhere", ms: 60_000 }));
+      expect((await evaluate(unreadable, daemon)).isError).toBe(true);
+    } finally { daemon.cleanup(); }
+  });
+
+  it("clears a form left for the bot once the hold ends, in the browser's lane, and keeps refusing eval until it has", async () => {
+    const value = runtime();
+    const daemon = daemonSpec();
+    try {
+      const clear = vi.fn(async () => undefined);
+      await value.withSecretInput("s", daemon.spec, filled({ url: "http://fixture.test/after", ms: 50, clear }));
+      await vi.waitFor(() => expect(clear).toHaveBeenCalledTimes(1));
+      expect((await evaluate(value, daemon)).isError).toBeUndefined();
+
+      const held = vi.fn(async () => undefined);
+      await value.withSecretInput("s", daemon.spec, filled({ url: "http://fixture.test/after", ms: 300, clear: held }));
+      // In the same tick, so the person holds the browser before the hold's timer can run; Node runs timers in order of
+      // expiry, so the clear has been tried once the longer sleep returns.
+      const taking = value.take("s", "person");
+      await sleep(600);
+      await taking;
+      value.release("s", "person");
+      expect(held).not.toHaveBeenCalled();
+      expect((await evaluate(value, daemon)).isError).toBe(true);
+      await value.close("s");
+      expect((await evaluate(value, daemon)).isError).toBeUndefined();
+    } finally { daemon.cleanup(); }
   });
 });
 

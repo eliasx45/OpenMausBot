@@ -5,6 +5,7 @@ import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 import { titleCaseModelId } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
+import { discoverAcpModels } from "./custom-model-catalog.ts";
 import type { AcpQuestionRequest } from "./question-requests.ts";
 import {
   capAnswerEcho, formatQuestionAnswers, MAX_QUESTIONS, parseChoices, parseProtocolAskQuestions, pickedOptionLabels, questionAnswersById,
@@ -99,6 +100,10 @@ export const STATIC_CURSOR_MODELS: ModelCatalog = {
   ],
 };
 
+/** Without parameterizedModelPicker Cursor (CLI 2026.10.19) offers only `composer-2.5[fast=true]`, so a
+ * `composer-2.5` bot bills as Fast; with it, Fast is a separate `fast` config option. */
+const CURSOR_CLIENT_META = { parameterizedModelPicker: true };
+
 const SLUG = /^[a-z0-9][a-z0-9._:+-]*$/i;
 const EXEC_TIMEOUT_MS = 8_000;
 
@@ -145,6 +150,17 @@ function pushModel(
   options.push({ id, label: labelFor(id, label), ...(custom ? { custom: true as const } : {}) });
 }
 
+function withUnseen(first: ModelCatalog["options"], rest: ModelCatalog["options"]): ModelCatalog["options"] {
+  const merged = first.map((option) => ({ ...option }));
+  const seen = new Set(merged.map((option) => option.id));
+  for (const option of rest) {
+    if (seen.has(option.id)) continue;
+    seen.add(option.id);
+    merged.push(option);
+  }
+  return merged;
+}
+
 export function decodeCursorModelCatalog(payload: unknown): ModelCatalog | null {
   const records: unknown[] = Array.isArray(payload)
     ? payload
@@ -182,14 +198,7 @@ export function decodeCursorModelCatalog(payload: unknown): ModelCatalog | null 
       : undefined) ??
     (seen.has(STATIC_CURSOR_MODELS.default) ? STATIC_CURSOR_MODELS.default : options[0]!.id);
 
-  const merged: ModelCatalog["options"] = STATIC_CURSOR_MODELS.options.map((option) => ({ ...option }));
-  const mergedSeen = new Set(merged.map((option) => option.id));
-  for (const option of options) {
-    if (mergedSeen.has(option.id)) continue;
-    mergedSeen.add(option.id);
-    merged.push(option);
-  }
-  return { default: defaultId, options: merged };
+  return { default: defaultId, options: withUnseen(STATIC_CURSOR_MODELS.options, options) };
 }
 
 function stripModelMarkers(label: string): { label: string; isDefault: boolean; isCurrent: boolean } {
@@ -228,18 +237,11 @@ export function decodeCursorModelText(text: string): ModelCatalog | null {
     if (isCurrent) markedCurrent = id;
   }
   if (!options.length) return null;
-  const merged: ModelCatalog["options"] = STATIC_CURSOR_MODELS.options.map((option) => ({ ...option }));
-  const mergedSeen = new Set(merged.map((option) => option.id));
-  for (const option of options) {
-    if (mergedSeen.has(option.id)) continue;
-    mergedSeen.add(option.id);
-    merged.push(option);
-  }
   const defaultId =
     (markedDefault && seen.has(markedDefault) ? markedDefault : undefined) ??
     (markedCurrent && seen.has(markedCurrent) ? markedCurrent : undefined) ??
     (seen.has(STATIC_CURSOR_MODELS.default) ? STATIC_CURSOR_MODELS.default : options[0]!.id);
-  return { default: defaultId, options: merged };
+  return { default: defaultId, options: withUnseen(STATIC_CURSOR_MODELS.options, options) };
 }
 
 function truthyAuthFlag(value: unknown): boolean | null {
@@ -311,11 +313,30 @@ export async function probeCursorAuth(
   return false;
 }
 
+export function cursorCatalogFromSession(advertised: ModelCatalog["options"]): ModelCatalog | null {
+  const discovered: ModelCatalog["options"] = [];
+  const bases = new Set<string>();
+  for (const model of advertised) {
+    const raw = model.id.split("[")[0]!.trim();
+    const id = raw.toLowerCase() === "default" ? STATIC_CURSOR_MODELS.default : raw;
+    pushModel(discovered, bases, id, model.label.trim().toLowerCase() === id.toLowerCase() ? titleCaseModelId(id, /[-_]+/) : model.label);
+  }
+  if (!discovered.length) return null;
+  const offered = STATIC_CURSOR_MODELS.options
+    .filter((option) => option.id === STATIC_CURSOR_MODELS.default || bases.has(option.id.replace(/-fast$/, "")));
+  return { default: STATIC_CURSOR_MODELS.default, options: withUnseen(offered, discovered) };
+}
+
+/** `cursor-agent models` (2026.10.22) lists only `auto` while session/new lists every model the account can use, so the
+ * session answers first; the text list stands in for a CLI that cannot open one. */
 export async function fetchCursorModels(
   cli: string,
   env: Record<string, string | undefined>,
   run: typeof execCli = execCli,
 ): Promise<ModelCatalog> {
+  const fromSession = await discoverAcpModels(env, cli, ["acp"], { variants: false, clientCapabilitiesMeta: CURSOR_CLIENT_META })
+    .then((catalog) => cursorCatalogFromSession(catalog.options), () => null);
+  if (fromSession) return fromSession;
   // Live CLI prints plain text (`slug - Label`); `--format json` is not supported yet.
   for (const args of [["models"], ["--list-models"]] as const) {
     const stdout = await execText(run, cli, [...args], env);
@@ -392,9 +413,32 @@ export const CURSOR_ASK_QUESTION: AcpQuestionRequest = {
   },
 };
 
+async function setCursorFast(
+  request: (method: string, params: unknown) => Promise<unknown>,
+  sessionId: string,
+  fast: boolean,
+): Promise<void> {
+  let reply: { configOptions?: Array<{ id?: unknown; currentValue?: unknown }> } | undefined;
+  try {
+    reply = (await request("session/set_config_option", { sessionId, configId: "fast", value: String(fast) })) as typeof reply;
+  } catch (e) {
+    // -32602: the chosen model has no Fast variant, so there is nothing to switch.
+    if ((e as { code?: unknown }).code !== -32602) throw e;
+    return;
+  }
+  // Cursor can acknowledge the switch yet keep its default Fast variant, so only the echoed value counts.
+  const confirmed = reply?.configOptions?.find((option) => option?.id === "fast")?.currentValue;
+  if (confirmed !== String(fast)) {
+    throw new Error(
+      `Cursor did not confirm Fast ${fast ? "on" : "off"} (fast is ${confirmed === undefined ? "unreported" : JSON.stringify(confirmed)}), ` +
+        "so the turn was not sent. Check that `cursor-agent` is current.",
+    );
+  }
+}
+
 const support = (run: typeof execCli): AcpSupport => ({
   driverKind: "cursorAgent",
-  questionRequests: { "cursor/ask_question": CURSOR_ASK_QUESTION },
+  questionRequests: { "cursor/ask_question": CURSOR_ASK_QUESTION }, askTool: "AskQuestion",
   displayName: "Cursor",
   models: STATIC_CURSOR_MODELS,
   // Other coding agents can install a generic `agent` shim; `cursor-agent` is unambiguous.
@@ -431,10 +475,15 @@ const support = (run: typeof execCli): AcpSupport => ({
   isAuthenticated: (env, config) => probeCursorAuth(config.cli || "cursor-agent", env, run),
   classifyError: classifyCursorError,
 
-  async configureSession({ request, sessionId, turn, sessionModels, currentModelId, notice }) {
+  clientCapabilitiesMeta: CURSOR_CLIENT_META,
+
+  async configureSession({ request, sessionId, turn, sessionModels, currentModelId, configOptions, notice }) {
     if (!turn.model) return;
-    const match = matchCursorAcpModel(sessionModels ?? [], turn.model);
-    const modelId = match?.modelId ?? turn.model;
+    const fastOption = configOptions.some((option) => option?.id === "fast");
+    const wantsFast = /-fast$/i.test(turn.model);
+    const wanted = fastOption && wantsFast ? turn.model.slice(0, -"-fast".length) : turn.model;
+    const match = matchCursorAcpModel(sessionModels ?? [], wanted);
+    const modelId = match?.modelId ?? wanted;
     try {
       await request("session/set_model", { sessionId, modelId });
       if (match && !match.exact) {
@@ -459,6 +508,7 @@ const support = (run: typeof execCli): AcpSupport => ({
           `Check that \`cursor-agent\` is current and that this account can use that model.`,
       );
     }
+    if (fastOption) await setCursorFast(request, sessionId, wantsFast);
   },
 
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),

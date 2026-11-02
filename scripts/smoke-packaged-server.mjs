@@ -123,6 +123,14 @@ while (Date.now() < deadline) {
   await new Promise((resolve) => setTimeout(resolve, 300));
 }
 
+// The image ships dist-server without the repo's package.json (Dockerfile): the version must come from the bundle.
+let versionReport = null;
+if (listening) {
+  try {
+    versionReport = (await (await fetch(`http://127.0.0.1:${port}/.well-known/openmausbot/environment`, { signal: AbortSignal.timeout(5_000) })).json()).version;
+  } catch (error) { versionReport = String(error); }
+}
+
 let searchReport = null;
 if (listening) {
   try {
@@ -274,7 +282,8 @@ if (listening) {
 }
 
 // The container image runs the server through server-launcher.js: it must start
-// index.js as its own child, and SIGTERM must end both with a clean exit.
+// the server as its own child, through the bootstrap that keeps Node's compile
+// cache on the data volume, and SIGTERM must end both with a clean exit.
 let launcherReport = null;
 if (listening && process.platform !== "win32") {
   const launcherHome = mkdtempSync(join(tmpdir(), "omb-smoke-launcher-"));
@@ -298,13 +307,20 @@ if (listening && process.platform !== "win32") {
       } catch { /* not up yet */ }
       if (serverPid === null) await new Promise((resolve) => setTimeout(resolve, 300));
     }
+    // The bootstrap writes the cache about 10 s after the server starts.
+    const launcherCache = join(launcherHome, ".openmausbot", "cache", "node-compile");
+    let cached = false;
+    for (const written = Date.now() + 30_000; serverPid !== null && !cached && Date.now() < written && launcher.exitCode === null;) {
+      try { cached = readdirSync(launcherCache).some((name) => /^v\d+\.\d+\.\d+-/.test(name)); } catch { /* not yet */ }
+      if (!cached) await new Promise((resolve) => setTimeout(resolve, 300));
+    }
     launcher.kill("SIGTERM");
     let timer;
     const exit = await Promise.race([exited, new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), 20_000); })]);
     clearTimeout(timer);
     let stillServing = false;
     try { await fetch(`http://127.0.0.1:${launcherPort}/api/health`, { signal: AbortSignal.timeout(2_000) }); stillServing = true; } catch { /* stopped */ }
-    launcherReport = { serverPid, launcherPid: launcher.pid, exit, stillServing, output: launcherOutput.slice(-2_000) };
+    launcherReport = { serverPid, launcherPid: launcher.pid, cached, exit, stillServing, output: launcherOutput.slice(-2_000) };
   } catch (error) {
     launcherReport = { error: String(error), output: launcherOutput.slice(-2_000) };
   } finally {
@@ -369,8 +385,8 @@ if (listening) {
 cleanup();
 
 if (launcherReport && (launcherReport.error || !launcherReport.serverPid || launcherReport.serverPid === launcherReport.launcherPid ||
-  launcherReport.exit?.code !== 0 || launcherReport.stillServing)) {
-  console.error("the packaged container launcher did not run the server as its child and stop it cleanly:");
+  !launcherReport.cached || launcherReport.exit?.code !== 0 || launcherReport.stillServing)) {
+  console.error("the packaged container launcher did not run the server as its child on its compile cache and stop it cleanly:");
   console.error(JSON.stringify(launcherReport, null, 2));
   process.exit(1);
 }
@@ -386,6 +402,12 @@ if (!listening) {
   console.error(`the packaged server never served /api/health on port ${port}.`);
   console.error(`exit code: ${child.exitCode}`);
   console.error(output.trim() || "(no output)");
+  process.exit(1);
+}
+
+const repoVersion = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
+if (!process.env.OMB_SMOKE_DIST && versionReport !== repoVersion) {
+  console.error(`The packaged server reports version ${JSON.stringify(versionReport)}, not ${repoVersion}.`);
   process.exit(1);
 }
 

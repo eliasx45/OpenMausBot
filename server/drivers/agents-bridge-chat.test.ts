@@ -45,11 +45,13 @@ it("a bridged turn on the chat-completions runtime carries on after use_tool nam
       return;
     }
     let data = "";
+    // Only a turn's POST carries a body; the Ollama probe GETs /api/version first (ollama-context.ts).
+    if (request.method !== "POST") { response.writeHead(404); response.end(); return; }
     for await (const part of request) data += part.toString();
     requests.push(JSON.parse(data) as ChatRequest);
     if (requests.length === 1) calls(response, "call_guess", "agents_use_tool", { name: "schedule_task", arguments: { every: "morning" } });
     else if (requests.length === 2) calls(response, "call_search", "agents_find_tool", { query: "schedule a recurring task every morning" });
-    else sse(response, { content: "The tool for that is propose_routine." }, "stop");
+    else sse(response, { content: "The tool for that is create_trigger." }, "stop");
   });
   await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
   const address = provider.address();
@@ -81,7 +83,7 @@ it("a bridged turn on the chat-completions runtime carries on after use_tool nam
   // The model was handed the bridged list.
   const handed = requests[0]!.tools!.map((tool) => tool.function.name);
   expect(handed).toEqual(expect.arrayContaining(["agents_coordinate_bots", "agents_find_tool", "agents_use_tool"]));
-  expect(handed).not.toContain("agents_propose_routine");
+  expect(handed).not.toContain("agents_create_trigger");
 
   // The wrong guess came back as a failed call it could read...
   expect(requests[1]!.messages.at(-1)).toMatchObject({ role: "tool", tool_call_id: "call_guess" });
@@ -90,15 +92,14 @@ it("a bridged turn on the chat-completions runtime carries on after use_tool nam
   expect(requests).toHaveLength(3);
   const searched = JSON.parse(requests[2]!.messages.at(-1)!.content as string) as { ok: boolean; result: string };
   expect(searched.ok).toBe(true);
-  expect((JSON.parse(searched.result) as { matches: Array<{ name: string }> }).matches[0]!.name).toBe("propose_routine");
+  expect((JSON.parse(searched.result) as { matches: Array<{ name: string }> }).matches[0]!.name).toBe("trigger");
   const tools = recorder.events.flatMap((event) => event.type === "item.completed" && event.itemType === "tool" ? [event.ok] : []);
   expect(tools).toEqual([false, true]);
-  expect(recorder.events.some((event) => event.type === "item.completed" && event.itemType === "assistant_text" && event.text === "The tool for that is propose_routine.")).toBe(true);
+  expect(recorder.events.some((event) => event.type === "item.completed" && event.itemType === "assistant_text" && event.text === "The tool for that is create_trigger.")).toBe(true);
 
-  // It ends the way any turn with a failed tool call ends on this runtime,
-  // not as a transport that broke under it.
+  // This fixture is on this machine, so the model counts as local: having searched and answered, it is not failed for
+  // its first guess, and nothing reads as a transport that broke under it.
   const errors = recorder.events.flatMap((event) => event.type === "runtime.error" ? [event.message] : []);
-  expect(errors.join("\n")).not.toMatch(/MCP request failed|MCP session closed|execution outcome may be uncertain/);
-  expect(completed).toMatchObject({ ok: false });
-  expect(errors).toEqual([expect.stringContaining("One or more tool operations failed or were denied")]);
+  expect(completed).toMatchObject({ ok: true });
+  expect(errors).toEqual([]);
 }, 30_000);

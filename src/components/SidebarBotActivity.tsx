@@ -6,6 +6,7 @@ import { roomThreadSpeakerId, roomThreadWorking } from "@/lib/room-threads";
 import { t } from "@/lib/i18n";
 import { isArchived, orderedSidebarThreads, orderedThreadList, threadRecency, threadUpdatedLabel } from "./SidebarThreadRow";
 import type { SidebarDensity } from "@/lib/sidebar-preferences";
+import { localizedTaskTitle } from "@/lib/task-title";
 
 export function sidebarBotActivityTasks(bot: Bot, queued: Record<string, unknown[]>, archivedApprovals = false): Array<Task & { queued: boolean }> {
   const tasks = bot.tasks ?? [{
@@ -19,6 +20,14 @@ export function sidebarBotActivityTasks(bot: Bot, queued: Record<string, unknown
     .filter((task) => task.activity === "waiting-on-you" || task.activity === "working" || task.busy || task.waitingForTeammates === true || task.queued || task.unread);
 }
 
+export function sidebarBotStatus(bot: Bot, queued: Record<string, unknown[]>) {
+  const tasks = sidebarBotActivityTasks(bot, queued);
+  const waiting = bot.activity === "waiting-on-you" || tasks.some((task) => task.activity === "waiting-on-you");
+  const working = !waiting && (Boolean(bot.busy) || tasks.some((task) => task.busy || task.activity === "working"));
+  const teammateWait = !waiting && !working && (Boolean(bot.waitingForTeammates) || tasks.some((task) => Boolean(task.waitingForTeammates)));
+  return { waiting, working, teammateWait, queued: tasks.some((task) => task.queued) };
+}
+
 export function threadsWhenTreeHidden(bot: Bot, queued: Record<string, unknown[]>) {
   const attention = sidebarBotActivityTasks(bot, queued);
   const seen = new Set(attention.map((task) => task.threadId));
@@ -26,6 +35,13 @@ export function threadsWhenTreeHidden(bot: Bot, queued: Record<string, unknown[]
     .filter((task) => task.pinned === true && !task.routineRunId && !seen.has(task.threadId))
     .map((task) => ({ ...task, queued: Boolean(queued[task.threadId]?.length) }));
   return orderedThreadList([...attention, ...pinned]);
+}
+
+/** Simple mode has no thread list, so a thread gets a row under its bot only while it waits on the person:
+ * it asks them something, or has a reply they have not read. A teammate's thread that ended on a card for them
+ * reaches the app only as unread, so unread is the signal. */
+export function threadsWaitingOnPerson(bot: Bot, queued: Record<string, unknown[]>) {
+  return orderedThreadList(sidebarBotActivityTasks(bot, queued).filter((task) => task.activity === "waiting-on-you" || task.unread));
 }
 
 /** Must derive each thread's state exactly as GroupThreadList's sidebar rows do. */
@@ -131,7 +147,7 @@ export function crossBotPinnedThreads(bots: Bot[], groups: Group[], queued: Reco
       : { kind: "bot", botId: botId!, botName: botName!, task });
 }
 
-export function AttentionThreadRows({ entries, onJump }: { entries: AttentionThread[]; onJump: (entry: AttentionThread) => void }) {
+export function AttentionThreadRows({ entries, onJump, inset = false }: { entries: AttentionThread[]; onJump: (entry: AttentionThread) => void; inset?: boolean }) {
   return <>
     {entries.map((entry) => {
       const { Icon, colorClass, label: status } = attentionRowStatus(entry.task);
@@ -139,8 +155,8 @@ export function AttentionThreadRows({ entries, onJump }: { entries: AttentionThr
       const label = t("attention.item", { title: entry.task.title, name, status });
       return <button key={`${entry.kind}-${entry.kind === "bot" ? entry.botId : entry.groupId}-${entry.task.threadId}`} type="button" aria-label={label} title={label}
         onClick={() => onJump(entry)}
-        className="flex w-full items-center gap-2.5 px-3.5 py-2 text-left text-[13px] text-ink hover:bg-raised/70">
-        <Icon size={15} aria-hidden="true" className={cn("shrink-0", colorClass)} />
+        className={cn("flex w-full items-center gap-2.5 text-left text-[13px] text-ink hover:bg-menu-hover", inset ? "rounded-md px-2 py-1.5" : "px-3.5 py-2")}>
+        <Icon size={inset ? 16 : 15} aria-hidden="true" className={cn("shrink-0", colorClass)} />
         <span className="min-w-0 flex-1">
           <span className="block truncate">{entry.task.title}</span>
           <span className="block truncate text-[11px] text-ink-secondary">{name} · {status}</span>
@@ -164,7 +180,7 @@ export function PinnedThreadRows({ entries, now, onJump, onUnpin }: { entries: A
       return <div key={key} className="group/pinned flex w-full items-center">
         <button type="button" aria-label={label} title={label}
           onClick={() => onJump(entry)}
-          className="flex min-w-0 flex-1 items-center gap-2.5 px-3.5 py-2 text-left text-[13px] text-ink hover:bg-raised/70">
+          className="flex min-w-0 flex-1 items-center gap-2.5 px-3.5 py-2 text-left text-[13px] text-ink hover:bg-menu-hover">
           <Icon size={15} aria-hidden="true" className={cn("shrink-0", status.active ? status.colorClass : "text-ink-secondary")} />
           <span className="min-w-0 flex-1">
             <span className="block truncate">{entry.task.title}</span>
@@ -180,8 +196,8 @@ export function PinnedThreadRows({ entries, now, onJump, onUnpin }: { entries: A
   </>;
 }
 
-export function SidebarBotActivity({ bot, rowThreadId, density, pendingQueued, dispatch }: { bot: Bot; rowThreadId: string; density: SidebarDensity; pendingQueued: AppState["pendingQueued"]; dispatch: Dispatch<Action> }) {
-  const tasks = threadsWhenTreeHidden(bot, pendingQueued).filter((task) => task.threadId !== rowThreadId);
+export function SidebarBotActivity({ bot, rowThreadId, density, pendingQueued, dispatch, waitingOnly = false }: { bot: Bot; rowThreadId: string; density: SidebarDensity; pendingQueued: AppState["pendingQueued"]; dispatch: Dispatch<Action>; waitingOnly?: boolean }) {
+  const tasks = (waitingOnly ? threadsWaitingOnPerson : threadsWhenTreeHidden)(bot, pendingQueued).filter((task) => task.threadId !== rowThreadId);
   if (!tasks.length) return null;
   const iconOnly = density === "icons";
   return <div data-sidebar-bot-activity={bot.id} className={cn("mb-1 space-y-0.5", !iconOnly && "ml-6")}>
@@ -190,13 +206,14 @@ export function SidebarBotActivity({ bot, rowThreadId, density, pendingQueued, d
       const teammateWait = !waiting && task.waitingForTeammates === true;
       const working = !waiting && !teammateWait && (task.busy || task.activity === "working");
       const status = waiting ? t("sidebar.preview.waiting") : working ? t("chat.activity.working") : teammateWait ? t("sidebar.preview.waitingOnTeammate") : task.queued ? t("task.queued") : t("task.unread");
-      const label = `${bot.name}: ${task.title} · ${status}${task.unread && (waiting || working || teammateWait || task.queued) ? ` · ${t("task.unread")}` : ""}`;
+      const title = localizedTaskTitle(task.title);
+      const label = `${bot.name}: ${title} · ${status}${task.unread && (waiting || working || teammateWait || task.queued) ? ` · ${t("task.unread")}` : ""}`;
       const Icon = waiting ? CircleAlert : working ? Loader2 : teammateWait || task.queued ? Clock3 : BellDot;
       return <button key={task.threadId} type="button" data-sidebar-activity-row={task.threadId} aria-label={label} title={label}
         onClick={() => dispatch({ type: "switchTask", botId: bot.id, threadId: task.threadId })}
         className={cn("flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] outline-none hover:bg-raised/50 focus-visible:ring-1 focus-visible:ring-accent/60", iconOnly && "justify-center", waiting ? "text-warning" : "text-ink-secondary")}>
         <Icon size={12} aria-hidden="true" className={cn("shrink-0", working && "animate-spin text-success", teammateWait && "text-warning", task.unread && !waiting && !working && !teammateWait && "text-accent")} />
-        {!iconOnly && <><span className="min-w-0 flex-1 truncate">{task.title}</span><span className="shrink-0 text-[10px]">{waiting ? t("task.waiting") : status}</span>
+        {!iconOnly && <><span className="min-w-0 flex-1 truncate">{title}</span><span className="shrink-0 text-[10px]">{waiting ? t("task.waiting") : status}</span>
           {task.unread && (waiting || working || teammateWait || task.queued) && <span className="size-1.5 shrink-0 rounded-full bg-accent" aria-hidden="true" />}</>}
       </button>;
     })}

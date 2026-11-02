@@ -54,11 +54,33 @@ non-streaming responses, tool errors, and lifecycle edge cases:
 pnpm exec vitest run server/drivers/openai-chat-tools.test.ts server/workspace.test.ts
 ```
 
+OpenAI-compatible and Cerebras turns recover explicit unfinished action
+announcements with at most three nudges per turn. Each nudge must be followed
+by tool progress before another is allowed; otherwise the turn fails as
+incomplete rather than reporting success. The detector also recognizes a clear
+first-person action promise in the last paragraph of an explanation, while
+leaving questions, quoted examples, "let me know" closings and ordinary final
+reports alone. Denials and pending tool failures take precedence over
+announcement recovery. Earlier tool results stay in the conversation, and the
+nudge asks the model not to repeat an operation that may already have taken
+effect; whether a call runs is still decided by the turn's permissions.
+
 One turn stops after 64 model steps, or 200 tool calls in total (each reply
 may carry up to 32). The stop says so in one line with one next action: the
 steps so far already ran, so ask only for what's left (retrying the whole task
 would repeat them). A batch that would pass 200 runs none of its calls. There
 is no per-bot or per-thread setting for either number.
+
+A turn whose MCP servers offer more than the 128 tools a request may carry
+lists whole servers in turn order and reaches the rest through the
+`mcp_search_tools` / `mcp_describe_tool` / `mcp_call_tool` directory, whose
+three tools count toward the limit; no server is skipped for it. The bot's
+last budget is read at `GET /api/bots/ID/tool-budget`. The driver tests
+cover it with real stdio servers:
+
+```sh
+pnpm exec vitest run server/drivers/chat-mcp-tools.test.ts server/drivers/openai-chat-tools.test.ts
+```
 
 The harness proves the OpenAI-compatible adapter and the shared execution
 path. It does not establish that every third-party model supports tools, or

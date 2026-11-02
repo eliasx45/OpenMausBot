@@ -3,7 +3,9 @@
 // server. vite.config.ts is inherited on purpose (react, tailwind, the @ alias)
 // so the page renders exactly what the app renders; only the host, the port
 // and the /api target are pinned here.
+import { realpathSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 
@@ -30,6 +32,8 @@ export interface PreviewOptions {
   /** Vite's log level. Its default prints port and dependency notes on stdout,
    * ahead of anything the fixture prints there. */
   logLevel?: "info" | "warn" | "error" | "silent";
+  /** Set on every request the page sends the fixture, e.g. a Cloud home's edge headers and a paired device's token. */
+  proxyHeaders?: Record<string, string>;
 }
 
 export interface MountedPreview {
@@ -52,14 +56,15 @@ export async function mountPreview(
   fixture: { info: { url: string } },
   options: PreviewOptions,
 ): Promise<MountedPreview> {
-  const { entry, route, title, extraRoutes = [], viewport = "width=device-width, initial-scale=1", logLevel } = options;
+  const { entry, route, title, extraRoutes = [], viewport = "width=device-width, initial-scale=1", logLevel, proxyHeaders } = options;
   const page = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="${escapeHtml(viewport)}"><title>${escapeHtml(title)}</title></head><body><div id="root"></div><script type="module" src="${escapeHtml(entry)}"></script></body></html>`;
   const ui = await createServer({
     root: REPO_ROOT,
     ...(logLevel ? { logLevel } : {}),
-    server: { host: "127.0.0.1", port: 0, proxy: {
-      "/api": { target: fixture.info.url },
-      "/.well-known/openmausbot/environment": { target: fixture.info.url },
+    // A worktree's node_modules may be a link to another checkout's: its files (the fonts) are served from there.
+    server: { host: "127.0.0.1", port: 0, fs: { allow: [REPO_ROOT, realpathSync(join(REPO_ROOT, "node_modules"))] }, proxy: {
+      "/api": { target: fixture.info.url, ...(proxyHeaders ? { headers: proxyHeaders } : {}) },
+      "/.well-known/openmausbot/environment": { target: fixture.info.url, ...(proxyHeaders ? { headers: proxyHeaders } : {}) },
     } },
     plugins: [{
       name: "isolated-preview",

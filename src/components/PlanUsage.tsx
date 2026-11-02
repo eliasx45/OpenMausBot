@@ -3,7 +3,9 @@ import { Loader2, RefreshCw } from "lucide-react";
 import { api } from "@/state/store";
 import { t } from "@/lib/i18n";
 import { cn } from "@/lib/cn";
-import { Card } from "./SettingsPrimitives";
+import { Card, SIMPLE_CARD } from "./SettingsPrimitives";
+import { UsageSummaryCard } from "./CloudUsageMeter";
+import { formatPlanSpend, type PlanSpend } from "@/lib/plan-spend";
 
 interface PlanWindow {
   available: boolean;
@@ -17,6 +19,7 @@ interface PlanExtra {
   remainingPercent: number;
   usedPercent: number;
   resetsAt: string | null;
+  spend?: PlanSpend;
 }
 
 interface PlanModelUsage {
@@ -84,7 +87,22 @@ function usageTone(used: number): string {
 function windowLabel(label: string): string {
   if (label === "5-hour") return t("planUsage.fiveHour");
   if (label === "Weekly") return t("planUsage.weekly");
+  if (label === "Monthly spend") return t("planUsage.monthlySpend");
   return label;
+}
+
+function providerLabel(provider: Pick<PlanProvider, "name">): string {
+  const normalized = provider.name.trim().toLowerCase();
+  if (normalized === "chatgpt plan") return t("planUsage.provider.chatgptPlan");
+  if (normalized === "claude (api key)") return t("planUsage.provider.claudeApiKey");
+  return provider.name;
+}
+
+function providerError(provider: Pick<PlanProvider, "error">): string | null {
+  const message = provider.error?.trim();
+  if (!message) return null;
+  const signIn = /^Sign in again in (.+)$/i.exec(message);
+  return signIn ? t("planUsage.signInAgain", { provider: providerLabel({ name: signIn[1]! }) }) : message;
 }
 
 function WindowRow({
@@ -92,11 +110,13 @@ function WindowRow({
   window,
   now,
   usedHeadline = false,
+  detail,
 }: {
   label: string;
   window: PlanWindow;
   now: number;
   usedHeadline?: boolean;
+  detail?: string;
 }) {
   const when = window.available ? formatResetDistance(window.resetsAt, now) : null;
   const used = window.usedPercent ?? 0;
@@ -110,6 +130,7 @@ function WindowRow({
         <div className="min-w-0">
           <div className="flex flex-wrap items-baseline gap-x-2 text-[13px] text-ink">
             <span className="tabular-nums">{headline}</span>
+            {detail && <span data-plan-spend className="text-[12px] tabular-nums text-ink-secondary">{detail}</span>}
             {when && <span className="text-[12px] text-ink-secondary">{t("planUsage.resetsIn", { when })}</span>}
           </div>
           <div
@@ -130,7 +151,7 @@ function WindowRow({
   );
 }
 
-export function PlanUsage() {
+function usePlanUsage() {
   const [report, setReport] = useState<PlanUsageReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -168,6 +189,53 @@ export function PlanUsage() {
     void load(true);
   }, [report, now, load]);
 
+  return { report, loading, error, now, load };
+}
+
+/** The budget of a plan with no weekly window, to stand in for the weekly figure. */
+export function monthlySpend(report: Pick<PlanUsageReport, "providers"> | null): { provider: PlanProvider; budget: PlanExtra } | null {
+  for (const provider of report?.providers ?? []) {
+    const budget = provider.ok && !provider.weekly.available ? provider.extra.find((extra) => extra.label === "Monthly spend") : undefined;
+    if (budget) return { provider, budget };
+  }
+  return null;
+}
+
+export function busiestWeekly(report: Pick<PlanUsageReport, "providers"> | null): { provider: PlanProvider; used: number } | null {
+  let busiest: { provider: PlanProvider; used: number } | null = null;
+  for (const provider of report?.providers ?? []) {
+    const used = provider.ok && provider.weekly.available ? provider.weekly.usedPercent : null;
+    if (used !== null && (!busiest || used > busiest.used)) busiest = { provider, used };
+  }
+  return busiest;
+}
+
+export function PlanUsageSummary() {
+  const { report, now } = usePlanUsage();
+  if (!report) return null;
+  const busiest = busiestWeekly(report);
+  const spending = busiest ? null : monthlySpend(report);
+  if (spending) {
+    const name = providerLabel(spending.provider);
+    const used = Math.round(Math.min(100, Math.max(0, spending.budget.usedPercent)));
+    return <UsageSummaryCard kind="plan" title={t("settings.simple.billing.monthlySpend", { provider: name })} percent={used} label={`${name}: ${t("planUsage.used", { used })}`}
+      note={spending.budget.spend ? formatPlanSpend(spending.budget.spend) : null} />;
+  }
+  if (!busiest) {
+    return <section data-usage-summary="own-ai" className={cn(SIMPLE_CARD, "px-4 py-3.5 text-[14px] leading-5 text-ink-secondary")}>{t("settings.simple.billing.ownAi")}</section>;
+  }
+  const percent = Math.round(Math.min(100, Math.max(0, busiest.used)));
+  const when = formatResetDistance(busiest.provider.weekly.resetsAt, now);
+  const name = providerLabel(busiest.provider);
+  return (
+    <UsageSummaryCard kind="plan" title={t("settings.simple.billing.weekly", { provider: name })} percent={percent} label={`${name}: ${t("planUsage.used", { used: percent })}`}
+      note={when ? t("planUsage.resetsIn", { when }) : null} />
+  );
+}
+
+export function PlanUsage() {
+  const { report, loading, error, now, load } = usePlanUsage();
+
   return (
     <Card title={t("planUsage.title")} subtitle={t("planUsage.subtitle")}>
       <div className="mb-3 flex justify-end">
@@ -192,7 +260,7 @@ export function PlanUsage() {
           {report.providers.map((provider) => (
             <div key={provider.id} className="border-t border-hairline/30 pt-3 first:border-t-0 first:pt-0">
               <div className="mb-2 flex min-w-0 items-baseline gap-2">
-                <span className="truncate text-[14px] font-medium text-ink">{provider.name}</span>
+                <span className="truncate text-[14px] font-medium text-ink">{providerLabel(provider)}</span>
                 {provider.plan && <span className="truncate text-[12px] text-ink-secondary">{provider.plan}</span>}
               </div>
               {provider.ok ? (
@@ -204,6 +272,8 @@ export function PlanUsage() {
                       key={`${extra.label}-${index}`}
                       label={windowLabel(extra.label)}
                       now={now}
+                      usedHeadline={Boolean(extra.spend)}
+                      detail={extra.spend ? formatPlanSpend(extra.spend) : undefined}
                       window={{
                         available: true,
                         remainingPercent: extra.remainingPercent,
@@ -238,7 +308,7 @@ export function PlanUsage() {
                   )}
                 </div>
               ) : (
-                <p className="text-[13px] text-danger">{provider.error}</p>
+                <p className="text-[13px] text-danger">{providerError(provider)}</p>
               )}
             </div>
           ))}

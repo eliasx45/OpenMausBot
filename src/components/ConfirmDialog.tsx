@@ -9,12 +9,16 @@ export type ConfirmTone = "danger" | "neutral";
 export interface ConfirmDialogProps {
   open: boolean;
   title: string;
-  body: string;
+  body: ReactNode;
   confirmLabel: string;
+  /** The way out, "Cancel" unless given. */
+  cancelLabel?: string;
   tone?: ConfirmTone;
   icon?: ReactNode;
   onCancel: () => void;
   onConfirm: () => void;
+  /** A gentler way to the same end, offered beside the confirm button ("Archive instead"). */
+  alternative?: { label: string; onClick: () => void };
   pending?: boolean;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }
@@ -87,10 +91,12 @@ export function ConfirmDialogCard({
   title,
   body,
   confirmLabel,
+  cancelLabel = "Cancel",
   tone = "danger",
   icon,
   onCancel,
   onConfirm,
+  alternative,
   pending = false,
 }: ConfirmDialogProps & {
   ref?: React.Ref<HTMLDivElement>;
@@ -132,8 +138,10 @@ export function ConfirmDialogCard({
           disabled={pending}
           className="rounded-xl px-4 py-2 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
         >
-          Cancel
+          {cancelLabel}
         </button>
+        {alternative && <button type="button" data-confirm-alternative onClick={alternative.onClick} disabled={pending}
+          className="rounded-xl bg-accent px-4 py-2 text-[13px] font-medium text-white hover:brightness-110">{alternative.label}</button>}
         <button
           type="button"
           onClick={onConfirm}

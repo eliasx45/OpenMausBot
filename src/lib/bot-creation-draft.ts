@@ -19,6 +19,7 @@ export class BotCreationDraft {
   consent: Pick<BotUpdatePatch, "acknowledgeLocalAuto"> & { acknowledgePeerScope?: boolean } = {};
   routines: Routine[];
   preset?: ChosenPreset;
+  role?: string;
   avatarFile?: File;
   private avatarObjectUrl?: string;
 
@@ -55,6 +56,11 @@ export class BotCreationDraft {
     this.changed();
   }
 
+  chooseRole(role: string | undefined) {
+    this.role = role;
+    this.changed();
+  }
+
   setMemory(path: string, text: string | null) {
     if (text === null) delete this.template.memory[path];
     else this.template.memory[path] = text;
@@ -85,11 +91,11 @@ export class BotCreationDraft {
   dispose() { if (this.avatarObjectUrl) URL.revokeObjectURL(this.avatarObjectUrl); }
 
   private routine(input: RoutineInput, previous?: Routine): Routine {
-    const { groupId: _group, resultsThreadId: _results, schedule, ...fields } = input;
+    const { groupId: _group, resultsThreadId: _results, checks: _checks, access: _access, deliver: _deliver, schedule, ...fields } = input;
     const normalizedSchedule = schedule.type === "interval" ? {
       ...schedule, weekdays: schedule.weekdays ?? undefined,
       window: schedule.window ?? undefined, endsAt: schedule.endsAt ?? undefined,
-    } : schedule;
+    } : schedule.type === "limit_reset" ? { ...schedule, repeat: schedule.repeat ?? "once", at: schedule.at ?? null } : schedule;
     return {
       id: previous?.id ?? `draft-${crypto.randomUUID()}`, createdAt: previous?.createdAt ?? Date.now(),
       updatedAt: Date.now(), nextRunAt: null, runOn: "maus", ...previous, ...fields,
