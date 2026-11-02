@@ -493,6 +493,7 @@ const PENDING: Readonly<Record<string, ReadonlyArray<readonly [file: string, sni
     ["server/skill-request-card.ts", "… \n\nAdds one line to the prompt index; the body is read only when used"],
     ["server/team-memory-requests.ts", "Remembered for the team"],
     ["server/team-memory-requests.ts", "Remember this for the team?"],
+    ["server/host/team-memory.ts", "Remember this for the team?"],
     ["server/team-setup-requests.ts", "Team setup applied"],
     ["server/team-setup-requests.ts", "Team setup not applied"],
   ],
