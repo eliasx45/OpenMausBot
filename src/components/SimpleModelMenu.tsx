@@ -4,6 +4,7 @@ import type { Bot, InstanceInfo } from "@/state/store";
 import type { EffortLevel } from "../../shared/wire";
 import type { MenuGroup, MenuModelRow, SimpleMenu } from "@/lib/simple-model-menu";
 import { modelBlurb } from "@/lib/model-friendly";
+import { modelOptionLabel } from "@/lib/model-label";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
 import { BotAvatar } from "./Avatar";
@@ -23,7 +24,8 @@ export interface SimpleMenuActions {
   onToggle: (instance: InstanceInfo) => void;
   onSetUp: (instance: InstanceInfo, keyboard: boolean) => void;
   onCheckAgain: (instance: InstanceInfo) => void;
-  onManage: () => void;
+  /** Opens the provider settings; left out where they live on another computer. */
+  onManage?: () => void;
   onResetVariant?: () => void;
 }
 
@@ -59,8 +61,8 @@ function MenuModel({ instance, row, onPick }: { instance: InstanceInfo; row: Men
       data-org-blocked={row.blocked || undefined}
       disabled={row.blocked}
       aria-pressed={row.current}
-      aria-label={[option.label, option.provider, reason].filter(Boolean).join(" · ")}
-      title={[option.label, option.provider, reason ?? modelBlurb(option)].filter(Boolean).join(" · ")}
+      aria-label={[modelOptionLabel(option), option.provider, reason].filter(Boolean).join(" · ")}
+      title={[modelOptionLabel(option), option.provider, reason ?? modelBlurb(option)].filter(Boolean).join(" · ")}
       tabIndex={-1}
       onClick={() => onPick(instance, row.model ?? option.id, row.variant)}
       className={SIMPLE_MENU_ROW}
@@ -271,6 +273,7 @@ export function SimpleModelMenu(props: SimpleModelMenuProps) {
                   <Gutter><InstanceProviderMark instance={group.instance} size={14} subtle /></Gutter>
                   <span className="min-w-0 truncate">{group.label}</span>
                 </div>
+                {group.note && <p className={cn(MENU_NOTE, "pl-8 pt-0")}>{group.note}</p>}
                 <GroupBody group={group} props={props} />
               </div>
             );
@@ -287,25 +290,29 @@ export function SimpleModelMenu(props: SimpleModelMenuProps) {
         </div>
       </div>
 
-      <div data-simple-effort-band className="flex shrink-0 flex-col gap-0.5 border-t-[0.5px] border-ink/10 p-1.5">
-        {props.thinking && (
-          <>
-            <Thinking thinking={props.thinking} labelId={`${idPrefix}-thinking`} />
-            <div role="separator" className={MENU_SEPARATOR} />
-          </>
-        )}
-        {props.onResetVariant && (
-          <button type="button" data-menu-row data-simple-variant-default onClick={props.onResetVariant} className={MENU_ROW}>
-            <Gutter />
-            <span className="min-w-0 flex-1 truncate">{t("model.variant.session")}</span>
-          </button>
-        )}
-        <button type="button" data-menu-row data-simple-manage onClick={props.onManage} className={MENU_ROW}>
-          <Gutter><Settings size={16} strokeWidth={MENU_STROKE} className={MENU_ICON} aria-hidden="true" /></Gutter>
-          <span className="min-w-0 flex-1 truncate">{t("model.simple.manage")}</span>
-          <Forward />
-        </button>
-      </div>
+      {(props.thinking || props.onResetVariant || props.onManage) && (
+        <div data-simple-effort-band className="flex shrink-0 flex-col gap-0.5 border-t-[0.5px] border-ink/10 p-1.5">
+          {props.thinking && (
+            <>
+              <Thinking thinking={props.thinking} labelId={`${idPrefix}-thinking`} />
+              {(props.onResetVariant || props.onManage) && <div role="separator" className={MENU_SEPARATOR} />}
+            </>
+          )}
+          {props.onResetVariant && (
+            <button type="button" data-menu-row data-simple-variant-default onClick={props.onResetVariant} className={MENU_ROW}>
+              <Gutter />
+              <span className="min-w-0 flex-1 truncate">{t("model.variant.session")}</span>
+            </button>
+          )}
+          {props.onManage && (
+            <button type="button" data-menu-row data-simple-manage onClick={props.onManage} className={MENU_ROW}>
+              <Gutter><Settings size={16} strokeWidth={MENU_STROKE} className={MENU_ICON} aria-hidden="true" /></Gutter>
+              <span className="min-w-0 flex-1 truncate">{t("model.simple.manage")}</span>
+              <Forward />
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
