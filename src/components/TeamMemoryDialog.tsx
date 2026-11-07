@@ -5,7 +5,7 @@ import { Brain, Check, Loader2, Pin, Plus, Trash2, X } from "lucide-react";
 import type { ProjectEvidence, EvidenceStatus } from "../../shared/project-evidence";
 
 import { api } from "@/state/store";
-import { t } from "@/lib/i18n";
+import { intlLocale, t } from "@/lib/i18n";
 import type { LocaleKey } from "@/locales";
 import { cn } from "@/lib/cn";
 import { Select } from "./Select";
@@ -258,18 +258,18 @@ export function TeamMemoryDialog({ section, label, onClose }: { section: string;
                           onKeyDown={(event) => {
                             if (event.key === "Enter") (event.target as HTMLInputElement).blur();
                           }}
-                          aria-label={`${entry.name} detail`}
+                          aria-label={t("teamMemory.entryDetailLabel", { name: entry.name })}
                           className="mt-0.5 block w-full rounded bg-transparent px-1 py-0.5 text-[13px] text-ink outline-none hover:bg-card focus:bg-card"
                         />
                         <span className="block px-1 text-[11px] text-ink-secondary">
-                          {entry.source.botName || t("teamMemory.you")} · {new Date(entry.updatedAt).toLocaleDateString()} · {loadedIds.includes(entry.id) ? t("teamMemory.loaded") : t("teamMemory.searchable")}
+                          {entry.source.botName || t("teamMemory.you")} · {new Date(entry.updatedAt).toLocaleDateString(intlLocale())} · {loadedIds.includes(entry.id) ? t("teamMemory.loaded") : t("teamMemory.searchable")}
                         </span>
                         {entry.kind === "outcome" && <div className="mt-1 text-[12px] text-ink-secondary">
                           <p>{t("teamMemory.status", { status: entry.evidenceStatus ?? "unverified" })}</p>
-                          {entry.evidence && <><p>{t("teamMemory.project", { path: entry.evidence.project.path, revision: entry.evidence.project.sha256.slice(0, 12) })}</p><p>{t("teamMemory.artifacts")} {entry.evidence.artifacts.map((file, index) => <button key={file.path} className="mr-2 underline" onClick={() => void downloadEvidence(entry, index)}>{t("teamMemory.download", { path: file.path })}</button>)}</p><p>{t("teamMemory.check", { check: entry.evidence.check })}</p>{entry.evidence.approval && <p>{t("teamMemory.approved", { name: entry.evidence.approval.by, date: new Date(entry.evidence.approval.at).toLocaleString() })}{entry.evidenceStatus === "stale" ? t("teamMemory.staleApproval") : ""}.</p>}<p>{t("teamMemory.savedOnly")}</p>
+                          {entry.evidence && <><p>{t("teamMemory.project", { path: entry.evidence.project.path, revision: entry.evidence.project.sha256.slice(0, 12) })}</p><p>{t("teamMemory.artifacts")} {entry.evidence.artifacts.map((file, index) => <button key={file.path} className="mr-2 underline" onClick={() => void downloadEvidence(entry, index)}>{t("teamMemory.download", { path: file.path })}</button>)}</p><p>{t("teamMemory.check", { check: entry.evidence.check })}</p>{entry.evidence.approval && <p>{t("teamMemory.approved", { name: entry.evidence.approval.by, date: new Date(entry.evidence.approval.at).toLocaleString(intlLocale()) })}{entry.evidenceStatus === "stale" ? t("teamMemory.staleApproval") : ""}.</p>}<p>{t("teamMemory.savedOnly")}</p>
                             {entry.evidenceStatus !== "approved" && <button disabled={busyId !== null || entry.evidenceStatus === "stale"} className="underline disabled:opacity-50" onClick={() => void run(entry.id, () => api(`/api/team-memory/${entry.id}?${query}`, { method: "PATCH", body: JSON.stringify({ approveEvidence: true, expectedRevision: entry.revision }) }))}>{t("teamMemory.approve")}</button>}</>}
                         </div>}
-                        {!!entry.history?.length && <details className="mt-1 text-[11px] text-ink-secondary"><summary>{t("teamMemory.history")}</summary>{entry.history.map((version, index) => <div key={index} className="mt-1">{new Date(version.at).toLocaleDateString()}: {version.name} — {version.detail} <button disabled={busyId !== null} onClick={() => editDetail(entry, version.detail, version.name)} className="underline">{t("teamMemory.restore")}</button></div>)}</details>}
+                        {!!entry.history?.length && <details className="mt-1 text-[11px] text-ink-secondary"><summary>{t("teamMemory.history")}</summary>{entry.history.map((version, index) => <div key={index} className="mt-1">{new Date(version.at).toLocaleDateString(intlLocale())}: {version.name} — {version.detail} <button disabled={busyId !== null} onClick={() => editDetail(entry, version.detail, version.name)} className="underline">{t("teamMemory.restore")}</button></div>)}</details>}
                       </span>
                       <button aria-label={t(entry.pinned ? "teamMemory.unpin" : "teamMemory.pin", { name: entry.name })} aria-pressed={entry.pinned ?? false} disabled={busyId !== null} className="p-1 text-ink-secondary hover:text-accent" onClick={() => void run(entry.id, () => api(`/api/team-memory/${entry.id}?${query}`, { method: "PATCH", body: JSON.stringify({ pinned: !entry.pinned, expectedRevision: entry.revision }) }))}><Pin size={13} /></button>
                       <button

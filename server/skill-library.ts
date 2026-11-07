@@ -1,6 +1,6 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, renameSync } from "node:fs";
 import { z } from "zod";
@@ -9,6 +9,9 @@ import { learnedSkillDirectoryMatches, readReferenceFiles, referenceLimitError, 
 import { writeLibraryFiles } from "./skill-library-files.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR, type AppConfig } from "./config.ts";
+import { githubSkillOriginSchema, skillFolderDigest, skillFolderRecordSchema, writeSkillFolder } from "./skill-folder.ts";
+import { entryExistsWithoutFollowing } from "./skill-storage.ts";
+import type { GitHubSkillOrigin } from "../shared/skill-import.ts";
 import { isSkillName, parseSkillMd, SKILL_FILE_MAX_BYTES } from "../shared/skill-md.ts";
 import type { SkillPackageStamp } from "./skills.ts";
 
@@ -155,6 +158,10 @@ export interface SkillLibraryEntry {
   warnings: string[];
   skippedFiles: string[];
   package?: SkillPackageStamp;
+  /** The files beside SKILL.md and skillFolderDigest over them; absent for a skill that is SKILL.md alone. */
+  files?: string[];
+  filesSha256?: string;
+  github?: GitHubSkillOrigin;
   /** Replaced descriptions, oldest first, with when each was replaced, so a running conversation keeps its prompt. */
   descriptionHistory?: Array<{ description: string; until: number }>;
 }
@@ -183,6 +190,8 @@ export interface LibrarySkillListing {
   tags: string[];
   warnings: string[];
   skippedFiles: string[];
+  files?: string[];
+  github?: GitHubSkillOrigin;
 }
 
 const skillLibraryEntrySchema = z.object({
@@ -207,6 +216,8 @@ const skillLibraryEntrySchema = z.object({
     w: z.string().regex(/^[a-f0-9]{64}$/),
     via: z.literal("preset").optional(),
   }).optional(),
+  ...skillFolderRecordSchema,
+  github: githubSkillOriginSchema.optional(),
   descriptionHistory: z.array(z.object({ description: z.string(), until: z.number() })).optional(),
 });
 const skillLibraryIndexSchema = z.record(z.string(), skillLibraryEntrySchema);
@@ -270,7 +281,14 @@ export function librarySkillRevision(entry: { sha256: string; referencesSha256?:
 }
 
 function libraryContentMatches(root: string, entry: SkillLibraryEntry): boolean {
-  return learnedSkillDirectoryMatches(librarySkillDirectory(root, entry.name), entry.sha256, entry.referencesSha256);
+  if (!entry.filesSha256) return learnedSkillDirectoryMatches(librarySkillDirectory(root, entry.name), entry.sha256, entry.referencesSha256);
+  try {
+    const file = join(librarySkillDirectory(root, entry.name), "SKILL.md");
+    if (!existsSync(file) || sha256Hex(readFileSync(file, "utf8")) !== entry.sha256) return false;
+    return skillFolderDigest(librarySkillDirectory(root, entry.name), entry.files ?? []) === entry.filesSha256;
+  } catch {
+    return false;
+  }
 }
 
 export function readLibrarySkillReferences(name: string, root: string = skillsLibraryRoot()): Array<{ path: string; content: string }> | null {
@@ -297,8 +315,10 @@ function librarySkillListing(root: string, entry: SkillLibraryEntry): LibrarySki
     tags: entry.tags ?? [],
     warnings: intact
       ? entry.warnings
-      : [...entry.warnings, "stored SKILL.md changed after review — enablement is blocked"],
+      : [...entry.warnings, "stored skill files changed after review — enablement is blocked"],
     skippedFiles: entry.skippedFiles,
+    ...(entry.files ? { files: entry.files } : {}),
+    ...(entry.github ? { github: entry.github } : {}),
   };
 }
 
@@ -337,6 +357,10 @@ export function installLibrarySkill(input: {
   warnings?: string[];
   reviewState?: LibraryReviewState;
   package?: SkillPackageStamp;
+  /** The files beside SKILL.md, from prepareSkillFolder; with them the skill is stored and checked as a whole folder. */
+  files?: ReadonlyArray<{ path: string; content: string | Uint8Array; executable?: boolean }>;
+  skippedFiles?: string[];
+  github?: GitHubSkillOrigin;
   root?: string;
 }): LibrarySkillListing | { error: string } {
   const root = input.root ?? skillsLibraryRoot();
@@ -373,16 +397,53 @@ export function installLibrarySkill(input: {
     ...(input.compatibility ? { compatibility: input.compatibility } : {}),
     ...(tags?.length ? { tags } : {}),
     warnings: input.warnings ?? [],
-    skippedFiles: [],
+    skippedFiles: input.skippedFiles ?? [],
     ...(input.package ? { package: { ...input.package } } : {}),
+    ...(input.github ? { github: input.github } : {}),
   };
   // Bytes first, index second: the index is the commit point, so a crash leaves unreferenced bytes, never a dangling entry.
-  writeLibraryFiles(librarySkillDirectory(root, input.name), input.instructions, references, () => {
+  if (input.files?.length) {
+    if (references.length) return { error: "a skill folder carries its references among its files" };
+    const stored = storeLibraryFolder(root, input.name, input.instructions, input.files);
+    if ("error" in stored) return stored;
+    entry.files = input.files.map((file) => file.path);
+    entry.filesSha256 = stored.filesSha256;
     index[input.name] = entry;
     writeSkillLibraryIndex(root, index);
-  });
+  } else {
+    writeLibraryFiles(librarySkillDirectory(root, input.name), input.instructions, references, () => {
+      index[input.name] = entry;
+      writeSkillLibraryIndex(root, index);
+    });
+  }
   skillLibraryEvents.emit("invalidate", { kind: "install", name: input.name });
   return librarySkillListing(root, entry);
+}
+
+/** Written beside the library and renamed into place; bytes a crash left under the name, which no entry names, are set aside. */
+function storeLibraryFolder(
+  root: string,
+  name: string,
+  skillMd: string,
+  files: NonNullable<Parameters<typeof installLibrarySkill>[0]["files"]>,
+): { filesSha256: string } | { error: string } {
+  const directory = librarySkillDirectory(root, name);
+  const staged = join(root, "skills", `.install-${name}-${randomUUID()}`);
+  try {
+    mkdirSync(join(root, "skills"), { recursive: true, mode: 0o700 });
+    writeSkillFolder(staged, skillMd, files);
+    const filesSha256 = skillFolderDigest(staged, files.map((file) => file.path), { remember: false });
+    if (!filesSha256) throw new Error("the stored skill folder could not be read back");
+    if (entryExistsWithoutFollowing(directory)) {
+      mkdirSync(join(root, "archive", "unreferenced"), { recursive: true, mode: 0o700 });
+      renameSync(directory, join(root, "archive", "unreferenced", `${name}.${randomUUID()}`));
+    }
+    renameSync(staged, directory);
+    return { filesSha256 };
+  } catch (error) {
+    rmSync(staged, { recursive: true, force: true });
+    return { error: `the skill could not be stored: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 export function readLibrarySkillFile(name: string, root: string = skillsLibraryRoot()): string | null {
@@ -407,7 +468,7 @@ export function setLibrarySkillReviewState(
   const entry = index[name];
   if (!entry) return { error: `no library skill named "${name}"` };
   if (reviewState === "approved" && !libraryContentMatches(root, entry)) {
-    return { error: "stored SKILL.md changed after review — the library entry cannot be approved" };
+    return { error: "stored skill files changed after review — the library entry cannot be approved" };
   }
   entry.reviewState = reviewState;
   writeSkillLibraryIndex(root, index);

@@ -9,6 +9,8 @@ vi.mock("@/lib/use-owner-or-admin", () => ({ useOwnerOrAdmin: () => false }));
 
 const { BotEditorStore, initialState } = await import("@/state/store");
 const { PermissionsSection } = await import("./PermissionsSection");
+const { setTeamPeople } = await import("@/state/team-people");
+const { t } = await import("@/lib/i18n");
 type Derived = Parameters<typeof PermissionsSection>[0]["derived"];
 
 const base: Bot = {
@@ -84,6 +86,21 @@ describe("Full access in bot settings", () => {
   });
 });
 
+describe("on a team", () => {
+  const chief: Bot = { ...base, chiefOfStaff: true, managedSections: ["Sales"] };
+  afterEach(() => setTeamPeople(null));
+
+  it("offers no Chief of Staff card and no departments to be in charge of; off a team both stay", () => {
+    render(chief);
+    expect(host.textContent).toContain(t("permissions.chief.title"));
+    expect(host.textContent).toContain(t("botAccess.teams.title"));
+    setTeamPeople({ people: [], me: null, admin: true, needsYou: [] });
+    render(chief);
+    expect(host.textContent).not.toContain(t("permissions.chief.title"));
+    expect(host.textContent).not.toContain(t("botAccess.teams.title"));
+  });
+});
+
 describe("PermissionsSection parts", () => {
   it("leaves Chief of Staff and peer checks out of a page that asks only for approvals", () => {
     const derived = {
@@ -102,6 +119,30 @@ describe("PermissionsSection parts", () => {
     render(base);
     expect(host.textContent).toContain("Chief of Staff");
     expect(host.textContent).toContain("Ask me before contacting other bots");
+  });
+});
+
+describe("Sending on your behalf", () => {
+  const option = (label: string) => [...host.querySelectorAll("button")].find((candidate) => candidate.textContent === label);
+
+  it("asks every time by default, and one click sends without asking", () => {
+    render(base);
+    expect(option("Ask every time")?.getAttribute("aria-pressed")).toBe("true");
+    flushSync(() => option("Send without asking")!.click());
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith({ type: "updateBot", botId: "pepper", patch: { outbound: { policy: "allow" } } });
+  });
+
+  it("has no limit to set or count, even for a rule saved with a daily cap", () => {
+    const fetched = vi.fn(() => new Promise(() => {}));
+    vi.stubGlobal("fetch", fetched);
+    render({ ...base, outbound: { policy: "allow", dailyCap: 25 } as Bot["outbound"] });
+    expect(option("Send without asking")?.getAttribute("aria-pressed")).toBe("true");
+    expect(host.querySelector("input")).toBeNull();
+    expect(host.textContent).not.toContain("used today");
+    expect(host.textContent).not.toContain("25");
+    expect(fetched).not.toHaveBeenCalled();
+    flushSync(() => option("Ask every time")!.click());
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith({ type: "updateBot", botId: "pepper", patch: { outbound: { policy: "ask" } } });
   });
 });
 
